@@ -1,0 +1,14 @@
+datasets>=2.19.0
+ir_datasets>=0.5.6
+sentence-transformers>=2.7.0
+bertopic>=0.16.0
+umap-learn>=0.5.6
+hdbscan>=0.8.36
+tiktoken>=0.7.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+qdrant-client>=1.9.0
+langchain-core>=0.2.0
+langchain-text-splitters>=0.2.0
+langchain-groq>=0.1.0
+python-dotenv>=1.0.0

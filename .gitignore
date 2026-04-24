@@ -1,0 +1,27 @@
+# Environments
+.venv/
+env/
+__pycache__/
+# Secrets
+.env
+
+output/
+full_data_dump/
+data_samples/
+*.csv
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+dist/
+*.egg-info/
+.env*
+*.log
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+.vscode/
+.idea/
+*.prof
