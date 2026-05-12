@@ -1,10 +1,10 @@
 """
-Vector Store Manager – Task 3 (§3.2)
+Vector Store Manager – Task 3
 
 Uses a local on-disk Qdrant instance (no server required), creates a collection
-for the enriched chunks produced by Task 2, embeds chunk texts with
-all-mpnet-base-v2 (768-d), and upserts them with full metadata payloads
-(keywords, labels, confidence).
+for enriched chunks, embeds each chunk's body text only with
+all-mpnet-base-v2 (768-d), and upserts vectors with metadata in the payload
+(keywords, topic labels, subtopics, anchor queries, etc.).
 """
 
 from __future__ import annotations
@@ -23,6 +23,9 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     PointStruct,
+    TextIndexParams,
+    TextIndexType,
+    TokenizerType,
     VectorParams,
 )
 from sentence_transformers import SentenceTransformer
@@ -35,6 +38,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_COLLECTION = "enriched_chunks"
 DEFAULT_QDRANT_DB_PATH = "output/qdrant_db"
 BATCH_UPSERT_SIZE = 64
+
+
+def _full_text_index_params() -> TextIndexParams:
+    """Parameters for Qdrant full-text payload indexes (anchor / keyword fields)."""
+    return TextIndexParams(
+        type=TextIndexType.TEXT,
+        tokenizer=TokenizerType.WORD,
+        min_token_len=2,
+        max_token_len=20,
+        lowercase=True,
+    )
 
 
 class VectorStoreManager:
@@ -88,6 +102,35 @@ class VectorStoreManager:
         else:
             logger.info("Collection '%s' already exists — reusing", self.collection_name)
 
+        self._ensure_lexical_payload_indexes()
+
+    def _ensure_lexical_payload_indexes(self) -> None:
+        """Create full-text payload indexes for hybrid lexical retrieval.
+
+        Indexes ``anchor_queries`` and ``keywords`` so ``MatchText`` filters
+        (used by the evaluation hybrid path) are efficient on a Qdrant server.
+        Local on-disk Qdrant ignores index metadata but still applies MatchText.
+        """
+        params = _full_text_index_params()
+        for field_name in ("anchor_queries", "keywords"):
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field_name,
+                    field_schema=params,
+                )
+                logger.info("Ensured full-text payload index on field %r", field_name)
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "already" in msg or "duplicate" in msg or "exists" in msg:
+                    logger.info("Full-text index on %r already present", field_name)
+                else:
+                    logger.warning(
+                        "Could not create full-text index on %r: %s",
+                        field_name,
+                        exc,
+                    )
+
     # ------------------------------------------------------------------
     # Loading enriched chunks
     # ------------------------------------------------------------------
@@ -126,12 +169,13 @@ class VectorStoreManager:
     def _build_payload(chunk: dict) -> dict:
         """Construct a Qdrant payload from an enriched-chunk dict.
 
-        Keeps all metadata produced by Task 2 so downstream stages
-        (synthetic query generation, hybrid reranking) can filter on it.
+        Dense vectors are built from ``text`` only; keywords, labels, subtopics,
+        and anchor queries live in the payload for decoupled retrieval.
         """
-        return {
+        doc_ids = list(chunk.get("doc_ids", []))
+        payload: dict = {
             "chunk_id": chunk["chunk_id"],
-            "doc_ids": chunk.get("doc_ids", []),
+            "doc_ids": doc_ids,
             "text": chunk["text"],
             "token_count": chunk.get("token_count", 0),
             "topic_id": chunk.get("topic_id", -1),
@@ -140,6 +184,31 @@ class VectorStoreManager:
             "confidence_score": chunk.get("confidence_score", 0.0),
             "subtopics": chunk.get("subtopics", []),
         }
+        if doc_ids:
+            payload["doc_id"] = str(doc_ids[0])
+
+        synthetic = chunk.get("synthetic_queries")
+        if synthetic is not None:
+            payload["synthetic_queries"] = synthetic
+        clusters = chunk.get("query_clusters")
+        if clusters is not None:
+            payload["query_clusters"] = clusters
+        if "optimal_k" in chunk:
+            payload["optimal_k"] = chunk["optimal_k"]
+
+        anchor_texts: list[str] = []
+        for item in synthetic or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("typology", "")).lower() != "anchor":
+                continue
+            t = str(item.get("text", "")).strip()
+            if t:
+                anchor_texts.append(t)
+        if anchor_texts:
+            payload["anchor_queries"] = anchor_texts
+
+        return payload
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -154,6 +223,7 @@ class VectorStoreManager:
 
         Returns the number of points successfully upserted.
         """
+        # Main vector: chunk body only (metadata is not concatenated here).
         texts = [c["text"] for c in chunks]
         vectors = self.embed_texts(texts)
 

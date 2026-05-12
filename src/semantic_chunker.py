@@ -1,9 +1,10 @@
 """
-Semantic Chunker – Task 1 (§3.0)
+Semantic Chunker – global sentence-level topic discovery and chunk formation.
 
-Loads a BEIR-compatible research corpus, segments documents into paragraphs,
-and applies hierarchical topic-based chunking to produce semantically cohesive
-segments of 256-512 tokens.
+Loads a BEIR-compatible corpus, splits documents into sentences, embeds each
+sentence as plain text (no document-id prefix), applies PCA before fitting a
+global Gaussian mixture model (BIC-selected K), then forms token-bounded
+chunks with semantic splits on topic boundaries.
 """
 
 from __future__ import annotations
@@ -12,27 +13,37 @@ import argparse
 import json
 import logging
 import re
-import sys
+from collections import Counter
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import ir_datasets
 import numpy as np
 import tiktoken
 from bertopic import BERTopic
+from bertopic.dimensionality import BaseDimensionalityReduction
 from sentence_transformers import SentenceTransformer
+from sklearn.decomposition import PCA
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.mixture import GaussianMixture
 
 logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
-EMBEDDING_DIM = 768
+EMBEDDING_DIM = 768  # kept for downstream vector stores using the same model
 MIN_TOKENS = 256
 MAX_TOKENS = 512
+MAX_GLOBAL_TOPICS = 20
+MIN_GLOBAL_K = 3
 DOCUMENT_LIMIT = 150
+# PCA reduces sentence embeddings before GMM to mitigate high-dimensional mixing issues.
+GMM_PCA_N_COMPONENTS = 15
 
-# Minimum paragraphs required for BERTopic to produce meaningful clusters
-_BERTOPIC_MIN_DOCS = 10
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_TOKENIZER = tiktoken.get_encoding("cl100k_base")
 
 
 @dataclass
@@ -45,12 +56,12 @@ class Chunk:
     keywords: list[str] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# 1. Corpus loading
-# ---------------------------------------------------------------------------
+def _count_tokens(text: str) -> int:
+    return len(_TOKENIZER.encode(text))
+
 
 def _get_evidence_doc_ids(dataset_name: str) -> set[str]:
-    """Extract all doc_ids that have positive relevance in the test qrels."""
+    """Collect doc_ids that have positive relevance in the test qrels."""
     canonical_name = dataset_name.split("/")[-1]
     dataset = ir_datasets.load(f"beir/{canonical_name}/test")
     evidence_ids: set[str] = set()
@@ -60,17 +71,8 @@ def _get_evidence_doc_ids(dataset_name: str) -> set[str]:
     return evidence_ids
 
 
-def load_corpus(dataset_name: str, limit: int = DOCUMENT_LIMIT) -> list[dict]:
-    """Load corpus filtered to documents that have evidence in the golden set.
-
-    Steps:
-      1. Load qrels from the test split and collect doc_ids with relevance > 0.
-      2. Stream the corpus split and keep only documents whose ``_id`` appears
-         in the evidence set.
-      3. Stop once *limit* documents have been collected.
-
-    Returns a list of dicts with keys ``doc_id``, ``title``, ``text``.
-    """
+def load_corpus(dataset_name: str, limit: int = DOCUMENT_LIMIT) -> list[dict[str, Any]]:
+    """Load corpus filtered to documents with evidence in the golden qrels."""
     logger.info("Loading corpus: %s (evidence-filtered, limit=%d)", dataset_name, limit)
 
     evidence_doc_ids = _get_evidence_doc_ids(dataset_name)
@@ -79,7 +81,7 @@ def load_corpus(dataset_name: str, limit: int = DOCUMENT_LIMIT) -> list[dict]:
     canonical_name = dataset_name.split("/")[-1]
     corpus_dataset = ir_datasets.load(f"beir/{canonical_name}/test")
 
-    documents: list[dict] = []
+    documents: list[dict[str, Any]] = []
     for doc in corpus_dataset.docs_iter():
         if doc.doc_id not in evidence_doc_ids:
             continue
@@ -97,321 +99,344 @@ def load_corpus(dataset_name: str, limit: int = DOCUMENT_LIMIT) -> list[dict]:
     return documents
 
 
-# ---------------------------------------------------------------------------
-# 2. Paragraph segmentation
-# ---------------------------------------------------------------------------
+def split_document_into_sentences(doc: dict[str, Any]) -> list[str]:
+    """Split one document into ordered sentences (title prepended to body like paragraph flow)."""
+    body = (doc.get("text") or "").strip()
+    title = (doc.get("title") or "").strip()
+    full_text = f"{title}\n\n{body}" if title else body
+    if not full_text:
+        return []
+    parts = _SENTENCE_SPLIT_RE.split(full_text)
+    out: list[str] = []
+    for p in parts:
+        s = p.strip()
+        if s:
+            out.append(s)
+    return out
 
-_PARAGRAPH_SPLIT_RE = re.compile(r"\n{2,}")
 
+def flatten_sentences_for_corpus(documents: list[dict[str, Any]]) -> tuple[list[str], list[str], list[list[str]]]:
+    """Return flat sentence strings for embedding, parallel doc_ids, and per-doc sentence lists.
 
-def segment_into_paragraphs(
-    documents: list[dict],
-    min_paragraph_len: int = 30,
-) -> tuple[list[str], list[str]]:
-    """Split each document's text into paragraph-level units.
-
-    Returns
-    -------
-    paragraphs : list[str]
-        Flat list of paragraphs across all documents.
-    para_doc_ids : list[str]
-        Parallel list mapping each paragraph to its source ``doc_id``.
+    Sentences are plain text only; doc_id is not concatenated (metadata lives in chunk / store).
     """
-    paragraphs: list[str] = []
-    para_doc_ids: list[str] = []
+    flat_sentence_texts: list[str] = []
+    flat_doc_ids: list[str] = []
+    sentences_per_doc: list[list[str]] = []
 
     for doc in documents:
-        full_text = doc["text"]
-        if doc["title"]:
-            full_text = doc["title"] + "\n\n" + full_text
+        doc_id = str(doc["doc_id"])
+        sents = split_document_into_sentences(doc)
+        sentences_per_doc.append(sents)
+        for s in sents:
+            flat_sentence_texts.append(s)
+            flat_doc_ids.append(doc_id)
 
-        parts = _PARAGRAPH_SPLIT_RE.split(full_text.strip())
-        for part in parts:
-            part = part.strip()
-            if len(part) >= min_paragraph_len:
-                paragraphs.append(part)
-                para_doc_ids.append(doc["doc_id"])
-
-    logger.info("Segmented into %d paragraphs", len(paragraphs))
-    return paragraphs, para_doc_ids
+    logger.info("Extracted %d sentences across %d documents", len(flat_sentence_texts), len(documents))
+    return flat_sentence_texts, flat_doc_ids, sentences_per_doc
 
 
-# ---------------------------------------------------------------------------
-# 3. Embedding
-# ---------------------------------------------------------------------------
-
-def embed_paragraphs(
-    paragraphs: list[str],
+def embed_sentence_texts(
+    sentence_texts: list[str],
     model: Optional[SentenceTransformer] = None,
     batch_size: int = 64,
 ) -> np.ndarray:
-    """Produce 768-d vectors for each paragraph using all-mpnet-base-v2."""
+    """Encode sentence strings with the shared embedding model (clean text only)."""
     if model is None:
         model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-    logger.info("Embedding %d paragraphs (batch_size=%d)", len(paragraphs), batch_size)
-    embeddings: np.ndarray = model.encode(
-        paragraphs,
+    logger.info("Embedding %d sentences (batch_size=%d)", len(sentence_texts), batch_size)
+    if not sentence_texts:
+        return np.zeros((0, EMBEDDING_DIM), dtype=np.float64)
+    arr: np.ndarray = model.encode(
+        sentence_texts,
         batch_size=batch_size,
         show_progress_bar=True,
         convert_to_numpy=True,
     )
-    return embeddings
+    return arr
 
 
-# ---------------------------------------------------------------------------
-# 4. Global topic discovery
-# ---------------------------------------------------------------------------
-
-def discover_global_topics(
+def reduce_embeddings_for_gmm(
     embeddings: np.ndarray,
-    paragraphs: list[str],
-    nr_topics: Optional[int] = None,
-) -> BERTopic:
-    """First-pass BERTopic for document-level topic discovery.
-
-    When the paragraph count is below the BERTopic minimum, a single-topic
-    fallback is used so the downstream pipeline can still proceed.
-    """
-    if len(paragraphs) < _BERTOPIC_MIN_DOCS:
-        logger.warning(
-            "Only %d paragraphs — too few for BERTopic. "
-            "Falling back to a single-topic assignment.",
-            len(paragraphs),
-        )
-        return _single_topic_fallback()
-
-    topic_model = BERTopic(
-        embedding_model=EMBEDDING_MODEL_NAME,
-        nr_topics=nr_topics,
-        verbose=True,
+    n_components: int = GMM_PCA_N_COMPONENTS,
+) -> np.ndarray:
+    """Apply PCA so GMM runs in a lower-dimensional subspace."""
+    n, d = int(embeddings.shape[0]), int(embeddings.shape[1])
+    if n == 0:
+        return embeddings
+    k = min(int(n_components), n, d)
+    if k < 1:
+        k = 1
+    pca = PCA(n_components=k, random_state=42)
+    reduced = pca.fit_transform(embeddings)
+    logger.info(
+        "PCA for GMM: %d samples, %d -> %d dimensions (explained variance ratio sum=%.4f)",
+        n,
+        d,
+        k,
+        float(np.sum(pca.explained_variance_ratio_)),
     )
-    topic_model.fit(paragraphs, embeddings)
-
-    topic_info = topic_model.get_topic_info()
-    logger.info("Discovered %d topics (incl. outlier -1)", len(topic_info))
-    return topic_model
+    return reduced
 
 
-def _single_topic_fallback() -> BERTopic:
-    """Return a minimally-fitted BERTopic model that assigns topic 0 to all docs."""
-    model = BERTopic(embedding_model=EMBEDDING_MODEL_NAME, nr_topics=1)
-    return model
+def find_optimal_k_bic(embeddings: np.ndarray, max_k: int, min_k: int = MIN_GLOBAL_K) -> int:
+    """Pick mixture component count K in [lower..upper] with lowest BIC (diagonal covariance).
 
-
-# ---------------------------------------------------------------------------
-# 5. Cluster assignment
-# ---------------------------------------------------------------------------
-
-def assign_paragraphs_to_clusters(
-    paragraphs: list[str],
-    para_doc_ids: list[str],
-    topic_model: BERTopic,
-    embeddings: np.ndarray,
-) -> dict[int, list[tuple[str, str]]]:
-    """Map each paragraph to its topic cluster.
-
-    Returns a dict mapping ``topic_id`` -> list of (doc_id, paragraph_text).
-    Outlier paragraphs (topic -1) are redistributed to the nearest valid
-    topic using embedding cosine similarity.
+    Expects *embeddings* in the same space used for GMM (typically PCA-reduced).
     """
-    if len(paragraphs) < _BERTOPIC_MIN_DOCS:
-        cluster: list[tuple[str, str]] = list(zip(para_doc_ids, paragraphs))
-        return {0: cluster}
-
-    topics, _ = topic_model.transform(paragraphs, embeddings)
-
-    clusters: dict[int, list[tuple[str, str]]] = {}
-    outliers: list[int] = []
-
-    for idx, topic_id in enumerate(topics):
-        topic_id = int(topic_id)
-        if topic_id == -1:
-            outliers.append(idx)
-            continue
-        clusters.setdefault(topic_id, []).append(
-            (para_doc_ids[idx], paragraphs[idx])
-        )
-
-    if outliers and clusters:
-        _redistribute_outliers(
-            outliers, paragraphs, para_doc_ids, embeddings, clusters, topic_model
-        )
-    elif outliers and not clusters:
-        clusters[0] = [
-            (para_doc_ids[i], paragraphs[i]) for i in outliers
-        ]
+    n = int(embeddings.shape[0])
+    if n <= 0:
+        return 1
+    upper = min(int(max_k), n)
+    lower = max(1, min(min_k, upper))
+    if upper < lower:
+        return 1
 
     logger.info(
-        "Assigned paragraphs to %d clusters (%d outliers redistributed)",
-        len(clusters),
-        len(outliers),
+        "BIC search: min_k=%d max_k=%d n=%d covariance_type=diag",
+        min_k,
+        max_k,
+        n,
     )
-    return clusters
 
+    best_k = 1
+    best_bic = float("inf")
 
-def _redistribute_outliers(
-    outlier_indices: list[int],
-    paragraphs: list[str],
-    para_doc_ids: list[str],
-    embeddings: np.ndarray,
-    clusters: dict[int, list[tuple[str, str]]],
-    topic_model: BERTopic,
-) -> None:
-    """Assign outlier paragraphs to the nearest non-outlier topic centroid."""
-    valid_topics = sorted(clusters.keys())
-    centroids = []
-    for tid in valid_topics:
-        topic_embs = []
-        for doc_id, text in clusters[tid]:
-            idx = next(
-                i for i, (d, p) in enumerate(zip(para_doc_ids, paragraphs))
-                if d == doc_id and p == text
+    for k in range(lower, upper + 1):
+        try:
+            gmm = GaussianMixture(
+                n_components=k,
+                covariance_type="diag",
+                random_state=42,
+                max_iter=200,
             )
-            topic_embs.append(embeddings[idx])
-        centroids.append(np.mean(topic_embs, axis=0))
-    centroids_matrix = np.vstack(centroids)
+            gmm.fit(embeddings)
+            bic = float(gmm.bic(embeddings))
+            if bic < best_bic:
+                best_bic = bic
+                best_k = k
+        except Exception as exc:
+            logger.debug("GMM fit failed for K=%d: %s", k, exc)
+            continue
 
-    for oidx in outlier_indices:
-        sims = embeddings[oidx] @ centroids_matrix.T
-        best_cluster_pos = int(np.argmax(sims))
-        best_topic = valid_topics[best_cluster_pos]
-        clusters[best_topic].append((para_doc_ids[oidx], paragraphs[oidx]))
-
-
-# ---------------------------------------------------------------------------
-# 6. Chunk refinement (merge / split to 256-512 token bounds)
-# ---------------------------------------------------------------------------
-
-_TOKENIZER = tiktoken.get_encoding("cl100k_base")
-
-
-def _count_tokens(text: str) -> int:
-    return len(_TOKENIZER.encode(text))
+    logger.info(
+        "BIC-optimal global K=%d (n=%d, min_k=%d, cap=%d, cov=diag)",
+        best_k,
+        n,
+        min_k,
+        max_k,
+    )
+    return best_k
 
 
-def refine_chunks(
-    clusters: dict[int, list[tuple[str, str]]],
-    min_tokens: int = MIN_TOKENS,
-    max_tokens: int = MAX_TOKENS,
-) -> list[Chunk]:
-    """Merge or split clustered paragraphs into token-bounded chunks.
-
-    Greedy merge: accumulate paragraphs until adding another would exceed
-    ``max_tokens``, then seal the chunk. If the accumulated text is below
-    ``min_tokens`` and more paragraphs exist, keep merging. After
-    exhausting the cluster, any oversized remainder is split at sentence
-    boundaries.
-    """
-    all_chunks: list[Chunk] = []
-    chunk_counter = 0
-
-    for topic_id in sorted(clusters.keys()):
-        items = clusters[topic_id]
-        buffer_text = ""
-        buffer_doc_ids: list[str] = []
-
-        for doc_id, para in items:
-            candidate = (buffer_text + "\n\n" + para).strip() if buffer_text else para
-            candidate_tokens = _count_tokens(candidate)
-
-            if candidate_tokens <= max_tokens:
-                buffer_text = candidate
-                if doc_id not in buffer_doc_ids:
-                    buffer_doc_ids.append(doc_id)
-            else:
-                if buffer_text:
-                    for chunk in _emit_chunks(
-                        buffer_text, buffer_doc_ids, topic_id,
-                        chunk_counter, min_tokens, max_tokens,
-                    ):
-                        all_chunks.append(chunk)
-                        chunk_counter += 1
-
-                buffer_text = para
-                buffer_doc_ids = [doc_id]
-
-        if buffer_text:
-            for chunk in _emit_chunks(
-                buffer_text, buffer_doc_ids, topic_id,
-                chunk_counter, min_tokens, max_tokens,
-            ):
-                all_chunks.append(chunk)
-                chunk_counter += 1
-
-    logger.info("Produced %d refined chunks", len(all_chunks))
-    return all_chunks
+def fit_global_sentence_gmm(
+    embeddings: np.ndarray,
+    k: int,
+) -> tuple[GaussianMixture, np.ndarray]:
+    """Fit a single global GMM and return the model and per-sample labels."""
+    n = int(embeddings.shape[0])
+    if n == 0:
+        raise ValueError("Cannot fit GMM on zero sentences.")
+    k_use = max(1, min(int(k), n))
+    gmm = GaussianMixture(
+        n_components=k_use,
+        covariance_type="diag",
+        random_state=42,
+        max_iter=200,
+    )
+    labels = gmm.fit_predict(embeddings)
+    return gmm, labels.astype(int)
 
 
-def _emit_chunks(
-    text: str,
-    doc_ids: list[str],
-    topic_id: int,
-    start_id: int,
+def _labels_for_sentences_per_doc(
+    sentences_per_doc: list[list[str]],
+    flat_labels: np.ndarray,
+) -> list[list[int]]:
+    """Map flat label order back to per-document sentence topic lists."""
+    topics_per_doc: list[list[int]] = []
+    idx = 0
+    for sents in sentences_per_doc:
+        row: list[int] = []
+        for _ in sents:
+            row.append(int(flat_labels[idx]))
+            idx += 1
+        topics_per_doc.append(row)
+    return topics_per_doc
+
+
+def _primary_topic(buffer_topics: list[int]) -> int:
+    """Majority topic in the buffer; ties broken by earliest sentence order."""
+    if not buffer_topics:
+        return -1
+    counts = Counter(buffer_topics)
+    max_c = max(counts.values())
+    for t in buffer_topics:
+        if counts[t] == max_c:
+            return int(t)
+    return int(buffer_topics[0])
+
+
+def _split_text_to_max_tokens(text: str, max_tokens: int) -> list[str]:
+    """Greedy word grouping so each piece is at most max_tokens (for oversized sentences)."""
+    words = text.split()
+    if not words:
+        return []
+    pieces: list[str] = []
+    buf: list[str] = []
+    for w in words:
+        trial = " ".join(buf + [w])
+        if buf and _count_tokens(trial) > max_tokens:
+            pieces.append(" ".join(buf))
+            buf = [w]
+        else:
+            buf.append(w)
+    if buf:
+        pieces.append(" ".join(buf))
+    return pieces
+
+
+def form_semantic_physical_chunks(
+    documents: list[dict[str, Any]],
+    sentences_per_doc: list[list[str]],
+    topics_per_doc: list[list[int]],
     min_tokens: int,
     max_tokens: int,
 ) -> list[Chunk]:
-    """Yield one or more Chunk objects, splitting oversized text if needed."""
-    topic_id = int(topic_id)
-    token_count = _count_tokens(text)
+    """Merge adjacent sentences per document with token bounds and global-topic boundaries."""
+    logger.debug("Chunking with min_tokens=%d max_tokens=%d", min_tokens, max_tokens)
+    all_chunks: list[Chunk] = []
+    chunk_counter = 0
 
-    if token_count <= max_tokens:
-        return [
-            Chunk(
-                chunk_id=f"chunk-{start_id:05d}",
-                doc_ids=list(doc_ids),
-                text=text,
-                token_count=token_count,
-                topic_id=topic_id,
-            )
-        ]
+    for doc, sents, topics in zip(documents, sentences_per_doc, topics_per_doc, strict=True):
+        doc_id = str(doc["doc_id"])
+        buffer_sents: list[str] = []
+        buffer_topics: list[int] = []
 
-    # Split on sentence boundaries for oversized text
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    chunks: list[Chunk] = []
-    buf = ""
-    buf_tokens = 0
-    cid = start_id
-
-    for sent in sentences:
-        sent_tokens = _count_tokens(sent)
-        if buf and buf_tokens + sent_tokens > max_tokens:
-            chunks.append(
+        def flush_buffer() -> None:
+            nonlocal chunk_counter
+            if not buffer_sents:
+                return
+            text = "\n\n".join(buffer_sents).strip()
+            tid = int(_primary_topic(buffer_topics))
+            all_chunks.append(
                 Chunk(
-                    chunk_id=f"chunk-{cid:05d}",
-                    doc_ids=list(doc_ids),
-                    text=buf.strip(),
-                    token_count=buf_tokens,
-                    topic_id=topic_id,
+                    chunk_id=f"chunk-{chunk_counter:05d}",
+                    doc_ids=[doc_id],
+                    text=text,
+                    token_count=_count_tokens(text),
+                    topic_id=tid,
                 )
             )
-            cid += 1
-            buf = sent
-            buf_tokens = sent_tokens
-        else:
-            buf = (buf + " " + sent).strip() if buf else sent
-            buf_tokens = _count_tokens(buf)
+            chunk_counter += 1
+            buffer_sents.clear()
+            buffer_topics.clear()
 
-    if buf:
-        chunks.append(
-            Chunk(
-                chunk_id=f"chunk-{cid:05d}",
-                doc_ids=list(doc_ids),
-                text=buf.strip(),
-                token_count=_count_tokens(buf.strip()),
-                topic_id=topic_id,
-            )
-        )
+        for sent, topic in zip(sents, topics, strict=True):
+            pieces = _split_text_to_max_tokens(sent, max_tokens) if _count_tokens(sent) > max_tokens else [sent]
+            for piece in pieces:
+                t = int(topic)
+                if buffer_sents and t != _primary_topic(buffer_topics):
+                    flush_buffer()
 
-    return chunks
+                candidate = "\n\n".join(buffer_sents + [piece]).strip() if buffer_sents else piece
+                if buffer_sents and _count_tokens(candidate) > max_tokens:
+                    flush_buffer()
+                    candidate = piece
+
+                buffer_sents.append(piece)
+                buffer_topics.append(t)
+
+        flush_buffer()
+
+    logger.info("Produced %d chunks (sentence-ordered, global-topic splits)", len(all_chunks))
+    return all_chunks
 
 
-# ---------------------------------------------------------------------------
-# 7. Orchestrator
-# ---------------------------------------------------------------------------
+def enrich_chunks_with_bertopic(chunks: list[Chunk], top_n_words: int = 5) -> None:
+    """Populate ``Chunk.keywords`` with c-TF-IDF terms from BERTopic guided by GMM topics.
 
-def _json_default(obj):
-    """Fallback serializer for numpy scalar types that may leak into JSON output."""
+    For each chunk, the GMM-derived primary topic is ``Chunk.topic_id`` (majority sentence
+    label inside the chunk). BERTopic is fit in supervised mode so ``y`` fixes topic
+    membership and only the class-based c-TF-IDF representation runs (no UMAP/HDBSCAN
+    discovery). Embeddings are a one-hot of ``y`` so no extra sentence-transformer pass
+    is required beyond the main pipeline.
+    """
+    if not chunks:
+        return
+
+    texts = [c.text for c in chunks]
+    topics = [int(c.topic_id) for c in chunks]
+
+    if any(t < 0 for t in topics):
+        logger.warning("Skipping BERTopic enrichment: negative topic_id in chunks.")
+        return
+
+    y = np.asarray(topics, dtype=int)
+    uniq = np.unique(y)
+    label_to_col = {int(v): i for i, v in enumerate(uniq)}
+    n = len(y)
+    k = len(uniq)
+    embeddings = np.zeros((n, k), dtype=np.float64)
+    for i, lab in enumerate(y):
+        embeddings[i, label_to_col[int(lab)]] = 1.0
+
+    vectorizer_model = CountVectorizer(stop_words="english")
+    topic_model = BERTopic(
+        umap_model=BaseDimensionalityReduction(),
+        hdbscan_model=LogisticRegression(max_iter=5000, random_state=42),
+        vectorizer_model=vectorizer_model,
+        calculate_probabilities=False,
+    )
+    topic_model.fit_transform(texts, embeddings=embeddings, y=topics)
+
+    mappings = topic_model.topic_mapper_.get_mappings()
+
+    for chunk in chunks:
+        primary_topic = int(chunk.topic_id)
+        bertopic_tid = int(mappings.get(primary_topic, primary_topic))
+        topic_words = topic_model.get_topic(bertopic_tid) or []
+        out: list[str] = []
+        for word, _score in topic_words:
+            w = (word or "").strip()
+            if w and w not in out:
+                out.append(w)
+            if len(out) >= top_n_words:
+                break
+        chunk.keywords = out
+
+
+def collect_core_sentences_per_topic(
+    sentence_embeddings: np.ndarray,
+    sentence_labels: np.ndarray,
+    flat_sentences: list[str],
+    top_n: int = 8,
+) -> list[dict[str, Any]]:
+    """For each GMM component, pick sentences with highest cosine similarity to the cluster centroid."""
+    if sentence_embeddings.shape[0] == 0:
+        return []
+
+    unique_topics = sorted(int(x) for x in np.unique(sentence_labels))
+    topics_payload: list[dict[str, Any]] = []
+
+    centroids = []
+    for tid in unique_topics:
+        mask = sentence_labels == tid
+        emb_k = sentence_embeddings[mask]
+        c = emb_k.mean(axis=0, keepdims=True)
+        centroids.append((tid, c, emb_k, np.where(mask)[0]))
+
+    for tid, centroid_row, emb_k, global_indices in centroids:
+        sims = cosine_similarity(emb_k, centroid_row).ravel()
+        order = np.argsort(-sims)
+        pick = order[: min(top_n, len(order))]
+        core = [flat_sentences[int(global_indices[j])] for j in pick]
+        topics_payload.append({"topic_id": tid, "core_sentences": core})
+
+    topics_payload.sort(key=lambda x: int(x["topic_id"]))
+    return topics_payload
+
+
+def _json_default(obj: Any) -> Any:
     if isinstance(obj, np.integer):
         return int(obj)
     if isinstance(obj, np.floating):
@@ -420,36 +445,76 @@ def _json_default(obj):
         return obj.tolist()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
+
+def write_global_topic_anchors(
+    path: Path,
+    k: int,
+    topics: list[dict[str, Any]],
+) -> None:
+    """Persist core sentences per global topic for downstream anchor-query generation."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "embedding_model": EMBEDDING_MODEL_NAME,
+        "k": int(k),
+        "topics": topics,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    logger.info("Wrote global topic anchors (%d topics) to %s", k, path)
+
+
 def run_pipeline(
     dataset_name: str,
     min_tokens: int = MIN_TOKENS,
     max_tokens: int = MAX_TOKENS,
     output_path: Optional[str] = None,
     limit: Optional[int] = None,
+    anchors_output_path: Optional[str] = None,
+    min_global_k: int = MIN_GLOBAL_K,
 ) -> list[Chunk]:
-    """End-to-end semantic chunking pipeline.
-
-    Parameters
-    ----------
-    dataset_name : str
-        BEIR dataset identifier (e.g. ``"scifact"``, ``"fiqa"``, ``"nfcorpus"``).
-    min_tokens, max_tokens : int
-        Token bounds for chunk refinement.
-    output_path : str | None
-        If provided, write serialized chunks to this JSON file.
-    limit : int | None
-        Max documents to load (evidence-filtered). Defaults to DOCUMENT_LIMIT (150).
-    """
+    """Run corpus load, global sentence GMM, and semantic–physical chunking."""
     doc_limit = limit if limit is not None else DOCUMENT_LIMIT
     documents = load_corpus(dataset_name, limit=doc_limit)
-    paragraphs, para_doc_ids = segment_into_paragraphs(documents)
-    embeddings = embed_paragraphs(paragraphs)
 
-    topic_model = discover_global_topics(embeddings, paragraphs)
-    clusters = assign_paragraphs_to_clusters(
-        paragraphs, para_doc_ids, topic_model, embeddings
-    )
-    chunks = refine_chunks(clusters, min_tokens=min_tokens, max_tokens=max_tokens)
+    flat_sentence_texts, _flat_doc_ids, sentences_per_doc = flatten_sentences_for_corpus(documents)
+    flat_sentences: list[str] = []
+    for sents in sentences_per_doc:
+        flat_sentences.extend(sents)
+
+    embed_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    embeddings = embed_sentence_texts(flat_sentence_texts, model=embed_model)
+
+    if embeddings.shape[0] == 0:
+        logger.warning("No sentences found; writing empty chunk list.")
+        chunks: list[Chunk] = []
+    else:
+        reduced = reduce_embeddings_for_gmm(embeddings, n_components=GMM_PCA_N_COMPONENTS)
+        optimal_k = find_optimal_k_bic(
+            reduced, MAX_GLOBAL_TOPICS, min_k=min_global_k
+        )
+        _gmm, labels = fit_global_sentence_gmm(reduced, optimal_k)
+        topics_per_doc = _labels_for_sentences_per_doc(sentences_per_doc, labels)
+        chunks = form_semantic_physical_chunks(
+            documents,
+            sentences_per_doc,
+            topics_per_doc,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
+        )
+
+        topics_payload = collect_core_sentences_per_topic(
+            embeddings, labels, flat_sentences, top_n=8
+        )
+
+        anchor_path: Optional[Path] = None
+        if anchors_output_path:
+            anchor_path = Path(anchors_output_path)
+        elif output_path:
+            anchor_path = Path(output_path).parent / "global_topic_anchors.json"
+        if anchor_path is not None:
+            write_global_topic_anchors(anchor_path, int(optimal_k), topics_payload)
+
+        enrich_chunks_with_bertopic(chunks)
 
     if output_path:
         out = Path(output_path)
@@ -467,10 +532,6 @@ def run_pipeline(
     return chunks
 
 
-# ---------------------------------------------------------------------------
-# CLI entry-point
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -478,7 +539,7 @@ def main() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        description="Semantic Chunker – load a BEIR corpus and produce topic-based chunks."
+        description="Semantic chunker – global sentence GMM and token-bounded chunks.",
     )
     parser.add_argument(
         "dataset",
@@ -489,7 +550,7 @@ def main() -> None:
         "--min-tokens",
         type=int,
         default=MIN_TOKENS,
-        help=f"Minimum tokens per chunk (default: {MIN_TOKENS})",
+        help=f"Minimum target tokens per chunk (default: {MIN_TOKENS})",
     )
     parser.add_argument(
         "--max-tokens",
@@ -504,10 +565,22 @@ def main() -> None:
         help="Output JSON file path for serialized chunks",
     )
     parser.add_argument(
+        "--anchors-output",
+        type=str,
+        default=None,
+        help="Path for global_topic_anchors.json (default: beside chunks output)",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Process only the first N documents from the corpus (useful for quick trials)",
+        help="Process only the first N evidence documents (quick trials)",
+    )
+    parser.add_argument(
+        "--min-global-k",
+        type=int,
+        default=MIN_GLOBAL_K,
+        help="Minimum number of global topics for GMM to discover (default: %(default)s).",
     )
 
     args = parser.parse_args()
@@ -517,6 +590,8 @@ def main() -> None:
         max_tokens=args.max_tokens,
         output_path=args.output,
         limit=args.limit,
+        anchors_output_path=args.anchors_output,
+        min_global_k=args.min_global_k,
     )
     print(f"Pipeline complete – {len(chunks)} chunks produced.")
 
