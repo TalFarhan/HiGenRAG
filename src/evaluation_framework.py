@@ -5,7 +5,8 @@ Loads SciFact claims with known ground-truth document IDs, runs each
 claim as a search query against both the baseline (naive-chunking) and
 enriched Qdrant collections. Baseline uses dense vectors only; enriched
 uses hybrid dense retrieval plus payload full-text match on generative
-anchors, fused with reciprocal rank fusion (RRF). Reports Hit@K, MRR, and
+anchors, fused with weighted reciprocal rank fusion (dense vs lexical).
+Reports Hit@K, MRR, and
 Precision@K alongside a causal-diagnosis example.
 """
 
@@ -25,7 +26,7 @@ from pathlib import Path
 import ir_datasets
 from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchText
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from semantic_chunker import EMBEDDING_MODEL_NAME
@@ -36,7 +37,9 @@ QDRANT_DB_PATH = "output/qdrant_db"
 ENRICHED_COLLECTION = "enriched_chunks"
 BASELINE_COLLECTION = "baseline_chunks"
 DATASET_NAME = "scifact"
-DOCUMENT_LIMIT = 150
+# None = treat every evidence-filtered corpus doc as indexed (SciFact: 283 docs,
+# 300 claims with gold in that set). Use an int to mirror a capped ingest.
+DOCUMENT_LIMIT: int | None = None
 # None = evaluate every eligible claim (gold doc in indexed subset). Use
 # ``--sample-size N`` for a fixed-size subset; sampling is deterministic
 # after a stable sort and ``random.seed``.
@@ -44,6 +47,9 @@ DEFAULT_CLAIM_SAMPLE_SIZE: int | None = None
 TOP_K = 3
 RANDOM_SEED = 42
 RRF_K = 60
+# Weighted RRF: dense (vector) ranks vs lexical / overlap ranks.
+RRF_DENSE_WEIGHT = 0.7
+RRF_LEXICAL_WEIGHT = 0.3
 ENRICHED_LEXICAL_PREFETCH_MIN = 32
 ENRICHED_PREFETCH_FACTOR = 20
 
@@ -72,7 +78,7 @@ class EvalResult:
 
 
 # ---------------------------------------------------------------------------
-# 1. Identify indexed document IDs (the 150-doc evidence-filtered subset)
+# 1. Identify indexed document IDs (evidence-filtered subset; optionally capped)
 # ---------------------------------------------------------------------------
 
 def _get_evidence_doc_ids(dataset_name: str) -> set[str]:
@@ -93,7 +99,7 @@ def _get_evidence_doc_ids(dataset_name: str) -> set[str]:
 
 def load_indexed_doc_ids(
     dataset_name: str = DATASET_NAME,
-    limit: int = DOCUMENT_LIMIT,
+    limit: int | None = DOCUMENT_LIMIT,
 ) -> set[str]:
     """Return the doc_ids of the evidence-filtered corpus subset.
 
@@ -101,11 +107,14 @@ def load_indexed_doc_ids(
       1. Collect doc_ids with positive relevance from the test qrels.
       2. Iterate over the ir_datasets corpus and keep only documents
          whose doc_id appears in the evidence set.
-      3. Stop once *limit* documents have been collected.
+      3. If *limit* is an int, stop once that many documents have been collected;
+         if *limit* is ``None``, include every matching document.
     """
+    lim_desc = "all" if limit is None else str(limit)
     logger.info(
-        "Loading evidence-filtered doc_ids from BeIR/%s corpus (limit=%d)",
-        dataset_name, limit,
+        "Loading evidence-filtered doc_ids from BeIR/%s corpus (limit=%s)",
+        dataset_name,
+        lim_desc,
     )
 
     evidence_doc_ids = _get_evidence_doc_ids(dataset_name)
@@ -119,7 +128,7 @@ def load_indexed_doc_ids(
         if doc.doc_id not in evidence_doc_ids:
             continue
         doc_ids.add(doc.doc_id)
-        if len(doc_ids) >= limit:
+        if limit is not None and len(doc_ids) >= limit:
             break
 
     logger.info("Indexed doc_id set contains %d evidence-filtered documents", len(doc_ids))
@@ -202,6 +211,12 @@ def load_claims_with_ground_truth(
 # 3. Search helpers (single shared QdrantClient, no locking conflicts)
 # ---------------------------------------------------------------------------
 
+def _chunk_text_from_enriched_payload(payload: dict) -> str:
+    """Return chunk body text stored on the enriched Qdrant payload."""
+    t = payload.get("text")
+    return str(t).strip() if t is not None else ""
+
+
 def _extract_doc_ids_from_payload(payload: dict) -> list[str]:
     """Safely extract document IDs from a Qdrant payload.
 
@@ -254,13 +269,30 @@ def _lexical_overlap_score(claim_text: str, payload: dict) -> int:
 def _reciprocal_rank_fusion(
     ranked_lists: list[list[str]],
     k: int = RRF_K,
+    list_weights: list[float] | None = None,
 ) -> list[tuple[str, float]]:
-    """Standard RRF: sum 1/(k + rank) across ranked result lists (point ids)."""
+    """Fuse ranked lists with weighted RRF: sum_i w_i / (k + rank_i).
+
+    When *list_weights* is omitted, each list contributes equally (legacy
+    behaviour). When provided, len(list_weights) must equal len(ranked_lists).
+    """
+    n_lists = len(ranked_lists)
+    if n_lists == 0:
+        return []
+    if list_weights is None:
+        weights = [1.0] * n_lists
+    else:
+        if len(list_weights) != n_lists:
+            raise ValueError(
+                f"list_weights length ({len(list_weights)}) must match "
+                f"ranked_lists ({n_lists})",
+            )
+        weights = list(list_weights)
     scores: dict[str, float] = defaultdict(float)
-    for ranked in ranked_lists:
+    for weight, ranked in zip(weights, ranked_lists):
         for rank, raw_id in enumerate(ranked, start=1):
             pid = str(raw_id)
-            scores[pid] += 1.0 / (k + rank)
+            scores[pid] += weight * (1.0 / (k + rank))
     return sorted(scores.items(), key=lambda item: (-item[1], item[0]))
 
 
@@ -269,11 +301,17 @@ def _search_baseline(
     model: SentenceTransformer,
     query: str,
     top_k: int = TOP_K,
+    collection_name: str = BASELINE_COLLECTION,
 ) -> tuple[list[str], list[float]]:
-    """Plain cosine-similarity search against the baseline collection."""
+    """Plain cosine-similarity (dense_only) search against any collection.
+
+    Each returned doc id is pipe-joined when the chunk spans multiple
+    documents so multi-doc payloads (sentence window / semantic chunker)
+    are compared correctly by ``_check_hit``.
+    """
     vec = model.encode(query, convert_to_numpy=True).tolist()
     hits = client.query_points(
-        collection_name=BASELINE_COLLECTION,
+        collection_name=collection_name,
         query=vec,
         limit=top_k,
     ).points
@@ -283,8 +321,8 @@ def _search_baseline(
     for hit in hits:
         payload = hit.payload or {}
         extracted = _extract_doc_ids_from_payload(payload)
-        did = extracted[0] if extracted else ""
-        doc_ids.append(did)
+        joined = "|".join(extracted) if extracted else ""
+        doc_ids.append(joined)
         scores.append(round(float(hit.score), 4))
     return doc_ids, scores
 
@@ -293,15 +331,21 @@ def _search_enriched(
     client: QdrantClient,
     model: SentenceTransformer,
     query: str,
-    top_k: int = TOP_K,
-) -> tuple[list[str], list[float]]:
-    """Hybrid dense + payload ``MatchText`` on anchors/keywords, fused with RRF."""
+    collect_limit: int = TOP_K,
+    collection_name: str = ENRICHED_COLLECTION,
+) -> tuple[list[str], list[float], list[str]]:
+    """Hybrid dense + payload ``MatchText`` on anchors/keywords, fused with weighted RRF.
+
+    Returns fused (doc_id rows, RRF scores, chunk texts) up to *collect_limit* rows.
+    Operates on any collection name; the caller is responsible for
+    ensuring the collection actually carries lexical payload fields.
+    """
     claim_text = query or ""
     vec = model.encode(claim_text, convert_to_numpy=True).tolist()
-    fetch_limit = max(top_k * ENRICHED_PREFETCH_FACTOR, ENRICHED_LEXICAL_PREFETCH_MIN)
+    fetch_limit = max(collect_limit * ENRICHED_PREFETCH_FACTOR, ENRICHED_LEXICAL_PREFETCH_MIN)
 
     dense_hits = client.query_points(
-        collection_name=ENRICHED_COLLECTION,
+        collection_name=collection_name,
         query=vec,
         limit=fetch_limit,
     ).points
@@ -323,7 +367,7 @@ def _search_enriched(
         )
         try:
             scroll_points, _ = client.scroll(
-                collection_name=ENRICHED_COLLECTION,
+                collection_name=collection_name,
                 scroll_filter=text_filter,
                 limit=fetch_limit,
                 with_payload=True,
@@ -354,10 +398,16 @@ def _search_enriched(
                 if pid not in payload_by_id:
                     payload_by_id[pid] = dict(getattr(r, "payload", None) or {})
 
-    fused = _reciprocal_rank_fusion(ranked_lists, k=RRF_K)
+    rrf_weights = (
+        [RRF_DENSE_WEIGHT, RRF_LEXICAL_WEIGHT]
+        if len(ranked_lists) > 1
+        else [RRF_DENSE_WEIGHT]
+    )
+    fused = _reciprocal_rank_fusion(ranked_lists, k=RRF_K, list_weights=rrf_weights)
 
     result_doc_ids: list[str] = []
     result_scores: list[float] = []
+    result_texts: list[str] = []
     for pid, rrf_score in fused:
         payload = payload_by_id.get(pid)
         if payload is None:
@@ -365,10 +415,36 @@ def _search_enriched(
         chunk_doc_ids = _extract_doc_ids_from_payload(payload)
         result_doc_ids.append("|".join(chunk_doc_ids))
         result_scores.append(round(rrf_score, 6))
-        if len(result_doc_ids) >= top_k:
+        result_texts.append(_chunk_text_from_enriched_payload(payload))
+        if len(result_doc_ids) >= collect_limit:
             break
 
-    return result_doc_ids, result_scores
+    return result_doc_ids, result_scores, result_texts
+
+
+def _cross_encoder_rerank_top_k(
+    cross_encoder: CrossEncoder,
+    claim_text: str,
+    doc_ids: list[str],
+    candidate_texts: list[str],
+    top_k: int,
+) -> tuple[list[str], list[float]]:
+    """Score (claim, chunk) pairs with a cross-encoder and keep the top-*top_k* rows."""
+    if not doc_ids:
+        return [], []
+    n = min(len(doc_ids), len(candidate_texts))
+    doc_ids = doc_ids[:n]
+    candidate_texts = candidate_texts[:n]
+    pairs = [[claim_text, ct] for ct in candidate_texts]
+    # Batch scoring; order matches *doc_ids*.
+    ce_scores = cross_encoder.predict(pairs)
+    order = sorted(range(n), key=lambda i: float(ce_scores[i]), reverse=True)
+    ranked_docs: list[str] = []
+    ranked_scores: list[float] = []
+    for i in order[:top_k]:
+        ranked_docs.append(doc_ids[i])
+        ranked_scores.append(round(float(ce_scores[i]), 6))
+    return ranked_docs, ranked_scores
 
 
 def _check_hit(ground_truth: set[str], returned_doc_ids: list[str]) -> bool:
@@ -441,11 +517,13 @@ def _qdrant_collection_names(client: QdrantClient) -> set[str]:
 
 def run_evaluation(
     db_path: str = QDRANT_DB_PATH,
-    document_limit: int = DOCUMENT_LIMIT,
+    document_limit: int | None = DOCUMENT_LIMIT,
     sample_size: int | None = DEFAULT_CLAIM_SAMPLE_SIZE,
     top_k: int = TOP_K,
     random_seed: int = RANDOM_SEED,
     compare_baseline: bool = True,
+    rerank_model: str | None = None,
+    rerank_candidates: int = 40,
 ) -> tuple[list[EvalResult], bool]:
     """Execute retrieval evaluation (Hit@K, MRR, Precision@K) vs SciFact test qrels.
 
@@ -463,6 +541,10 @@ def run_evaluation(
 
     logger.info("Initialising embedding model and Qdrant client")
     model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    cross_encoder: CrossEncoder | None = None
+    if rerank_model:
+        logger.info("Initialising cross-encoder re-ranker: %s", rerank_model)
+        cross_encoder = CrossEncoder(rerank_model)
     client = QdrantClient(path=db_path)
 
     existing = _qdrant_collection_names(client)
@@ -492,7 +574,23 @@ def run_evaluation(
             bl_doc_ids, bl_scores = [], []
             bl_hit = False
 
-        en_doc_ids, en_scores = _search_enriched(client, model, claim["text"], top_k)
+        collect_limit = (
+            max(rerank_candidates, top_k) if cross_encoder is not None else top_k
+        )
+        en_doc_ids, en_scores, en_texts = _search_enriched(
+            client, model, claim["text"], collect_limit=collect_limit,
+        )
+        if cross_encoder is not None:
+            en_doc_ids, en_scores = _cross_encoder_rerank_top_k(
+                cross_encoder,
+                claim["text"],
+                en_doc_ids,
+                en_texts,
+                top_k,
+            )
+        else:
+            en_doc_ids = en_doc_ids[:top_k]
+            en_scores = en_scores[:top_k]
         en_hit = _check_hit(gt, en_doc_ids)
 
         results.append(
@@ -524,6 +622,9 @@ def print_report(
     results: list[EvalResult],
     top_k: int = TOP_K,
     compare_baseline: bool = True,
+    enriched_method_label: str = "Enriched (hybrid w-RRF)",
+    rerank_model: str | None = None,
+    rerank_candidates: int = 40,
 ) -> None:
     """Print a formatted comparison table and a diagnostic example."""
     n = len(results)
@@ -562,6 +663,9 @@ def print_report(
 
     print(f"  Claims evaluated : {n}")
     print(f"  Top-K            : {top_k}")
+    if rerank_model:
+        print(f"  Re-ranker model  : {rerank_model}")
+        print(f"  Re-rank pool     : {rerank_candidates} candidates → top-{top_k}")
     print()
 
     table_rule = 72
@@ -602,7 +706,7 @@ def print_report(
             f"{bl_pct:>7.1f}% {bl_mrr:>7.3f} {bl_prec * 100:>7.1f}%",
         )
         print(
-            f"  {'Enriched (hybrid RRF)':<28} {en_hits:>6} {n - en_hits:>6} "
+            f"  {enriched_method_label:<28} {en_hits:>6} {n - en_hits:>6} "
             f"{en_pct:>7.1f}% {en_mrr:>7.3f} {en_prec * 100:>7.1f}%",
         )
         print(f"  {'-' * table_rule}")
@@ -627,7 +731,7 @@ def print_report(
         print(hdr)
         print(f"  {'-' * table_rule}")
         print(
-            f"  {'Enriched (hybrid RRF)':<28} {en_hits:>6} {n - en_hits:>6} "
+            f"  {enriched_method_label:<28} {en_hits:>6} {n - en_hits:>6} "
             f"{en_pct:>7.1f}% {en_mrr:>7.3f} {en_prec * 100:>7.1f}%",
         )
         print(f"  {'-' * table_rule}")
@@ -681,8 +785,8 @@ def print_report(
                 "    The generative pipeline produces semantically cohesive chunks\n"
                 "    enriched with anchor queries and keywords. Hybrid retrieval\n"
                 "    fuses dense similarity with lexical overlap on those fields\n"
-                "    (RRF), so the correct document surfaces in the top results\n"
-                "    even when naive fixed-size chunks scatter the evidence.\n",
+                "    (weighted RRF, dense-weighted), so the correct document surfaces\n"
+                "    in the top results even when naive fixed-size chunks scatter the evidence.\n",
             )
     else:
         diagnostic_hit = next((r for r in results if r.enriched_hit), None)
@@ -817,6 +921,443 @@ class EvaluationJsonExport:
 
 
 # ---------------------------------------------------------------------------
+# 7. Multi-collection ablation evaluation (4x2 matrix)
+# ---------------------------------------------------------------------------
+
+# Modes for the ablation matrix: dense_only ignores any payload anchors;
+# hybrid combines dense ranks with MatchText ranks on ``anchor_queries`` /
+# ``keywords``; ``both`` runs both modes back-to-back on the same collection.
+MODE_DENSE_ONLY = "dense_only"
+MODE_HYBRID = "hybrid"
+MODE_BOTH = "both"
+SUPPORTED_MODES: tuple[str, ...] = (MODE_DENSE_ONLY, MODE_HYBRID, MODE_BOTH)
+
+DEFAULT_COMPARISON_JSON = "output/comparison_report.json"
+DEFAULT_COMPARISON_MD = "output/comparison_report.md"
+
+
+def _collection_has_anchor_queries(
+    client: QdrantClient,
+    collection_name: str,
+    probe_limit: int = 32,
+) -> bool:
+    """Heuristically test whether ``anchor_queries`` exist on a collection's payload.
+
+    Scrolls a tiny window of points and inspects their payloads. Returns
+    True as soon as one point has a non-empty ``anchor_queries`` field.
+    The hybrid path uses this probe to decide whether to silently fall
+    back to ``dense_only`` (see :func:`run_single_collection_evaluation`).
+    """
+    try:
+        records, _ = client.scroll(
+            collection_name=collection_name,
+            limit=probe_limit,
+            with_payload=True,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not probe %r for anchor_queries (%s); assuming none.",
+            collection_name,
+            exc,
+        )
+        return False
+    for rec in records:
+        payload = getattr(rec, "payload", None) or {}
+        value = payload.get("anchor_queries")
+        if isinstance(value, list) and any(
+            isinstance(v, str) and v.strip() for v in value
+        ):
+            return True
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+@dataclass
+class CollectionEvalSummary:
+    """Aggregated metrics for one (collection, mode) cell of the ablation matrix."""
+
+    collection: str
+    mode: str
+    requested_mode: str
+    fell_back_to_dense_only: bool
+    total_claims: int
+    hits: int
+    hit_at_k: float
+    mrr: float
+    precision_at_k: float
+    top_k: int
+    detailed_results: list[dict]
+
+
+def _run_collection_search(
+    client: QdrantClient,
+    model: SentenceTransformer,
+    collection_name: str,
+    effective_mode: str,
+    claim_text: str,
+    top_k: int,
+    rerank_candidates: int,
+    cross_encoder: CrossEncoder | None,
+) -> tuple[list[str], list[float]]:
+    """Dispatch one claim to the right search function based on the mode."""
+    if effective_mode == MODE_DENSE_ONLY:
+        doc_ids, scores = _search_baseline(
+            client, model, claim_text, top_k=top_k, collection_name=collection_name,
+        )
+        return doc_ids, scores
+
+    # Hybrid path (with optional cross-encoder re-rank).
+    collect_limit = max(rerank_candidates, top_k) if cross_encoder is not None else top_k
+    doc_ids, scores, texts = _search_enriched(
+        client,
+        model,
+        claim_text,
+        collect_limit=collect_limit,
+        collection_name=collection_name,
+    )
+    if cross_encoder is not None:
+        doc_ids, scores = _cross_encoder_rerank_top_k(
+            cross_encoder, claim_text, doc_ids, texts, top_k,
+        )
+    else:
+        doc_ids = doc_ids[:top_k]
+        scores = scores[:top_k]
+    return doc_ids, scores
+
+
+def run_single_collection_evaluation(
+    client: QdrantClient,
+    model: SentenceTransformer,
+    collection_name: str,
+    mode: str,
+    claims: list[dict],
+    top_k: int = TOP_K,
+    cross_encoder: CrossEncoder | None = None,
+    rerank_candidates: int = 40,
+) -> CollectionEvalSummary:
+    """Evaluate one (collection, mode) cell of the ablation matrix.
+
+    Applies the safe-fallback rule: if ``mode == 'hybrid'`` but the
+    collection does not expose any ``anchor_queries`` payload, the
+    evaluation transparently switches to ``dense_only`` instead of
+    crashing. The ``fell_back_to_dense_only`` flag in the summary
+    records this decision for the final report.
+    """
+    if mode not in (MODE_DENSE_ONLY, MODE_HYBRID):
+        raise ValueError(
+            f"Unsupported single-cell mode: {mode!r}; use 'dense_only' or 'hybrid'."
+        )
+
+    effective_mode = mode
+    fell_back = False
+    if mode == MODE_HYBRID and not _collection_has_anchor_queries(
+        client, collection_name,
+    ):
+        logger.warning(
+            "Collection %r has no anchor_queries payload; hybrid mode falling "
+            "back to dense_only.",
+            collection_name,
+        )
+        effective_mode = MODE_DENSE_ONLY
+        fell_back = True
+
+    detailed: list[dict] = []
+    hits = 0
+    mrr_sum = 0.0
+    prec_sum = 0.0
+
+    for idx, claim in enumerate(claims, 1):
+        gt: set[str] = claim["ground_truth_doc_ids"]
+        doc_ids, scores = _run_collection_search(
+            client=client,
+            model=model,
+            collection_name=collection_name,
+            effective_mode=effective_mode,
+            claim_text=claim["text"],
+            top_k=top_k,
+            rerank_candidates=rerank_candidates,
+            cross_encoder=cross_encoder,
+        )
+        is_hit = _check_hit(gt, doc_ids)
+        if is_hit:
+            hits += 1
+        mrr_sum += reciprocal_rank_score(gt, doc_ids, top_k)
+        prec_sum += precision_at_k_score(gt, doc_ids, top_k)
+
+        detailed.append(
+            {
+                "claim_id": claim["claim_id"],
+                "claim_text": claim["text"],
+                "ground_truth_doc_id": _ground_truth_doc_id_string(gt),
+                "is_hit": is_hit,
+                "hit_rank": _first_relevant_rank(gt, doc_ids, top_k),
+                "top_k_results": [
+                    {"doc_id": d, "score": s} for d, s in zip(doc_ids, scores)
+                ],
+            }
+        )
+
+        if idx % 50 == 0 or idx == len(claims):
+            logger.info(
+                "[%s | %s] evaluated %d / %d claims (hits=%d)",
+                collection_name,
+                effective_mode,
+                idx,
+                len(claims),
+                hits,
+            )
+
+    n = len(claims)
+    return CollectionEvalSummary(
+        collection=collection_name,
+        mode=effective_mode,
+        requested_mode=mode,
+        fell_back_to_dense_only=fell_back,
+        total_claims=n,
+        hits=hits,
+        hit_at_k=(hits / n) if n else 0.0,
+        mrr=(mrr_sum / n) if n else 0.0,
+        precision_at_k=(prec_sum / n) if n else 0.0,
+        top_k=top_k,
+        detailed_results=detailed,
+    )
+
+
+def run_ablation_evaluation(
+    collections: list[str],
+    mode: str = MODE_BOTH,
+    db_path: str = QDRANT_DB_PATH,
+    document_limit: int | None = DOCUMENT_LIMIT,
+    sample_size: int | None = DEFAULT_CLAIM_SAMPLE_SIZE,
+    top_k: int = TOP_K,
+    random_seed: int = RANDOM_SEED,
+    rerank_model: str | None = None,
+    rerank_candidates: int = 40,
+) -> list[CollectionEvalSummary]:
+    """Run the 4x2 ablation matrix and return one summary per cell.
+
+    For ``mode == 'both'`` every collection is evaluated twice (once
+    dense_only, once hybrid). For ``mode in {'dense_only', 'hybrid'}``
+    each collection is evaluated once with the requested mode (hybrid may
+    fall back to dense_only as documented in
+    :func:`run_single_collection_evaluation`).
+    """
+    if mode not in SUPPORTED_MODES:
+        raise ValueError(
+            f"Unsupported --mode value {mode!r}; expected one of {SUPPORTED_MODES}."
+        )
+    if not collections:
+        raise ValueError("At least one collection name must be supplied.")
+
+    indexed_doc_ids = load_indexed_doc_ids(limit=document_limit)
+    claims = load_claims_with_ground_truth(
+        indexed_doc_ids, sample_size=sample_size, random_seed=random_seed,
+    )
+    if not claims:
+        logger.error("No eligible claims found - aborting ablation.")
+        return []
+
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    cross_encoder: CrossEncoder | None = None
+    if rerank_model:
+        logger.info("Initialising cross-encoder re-ranker: %s", rerank_model)
+        cross_encoder = CrossEncoder(rerank_model)
+
+    client = QdrantClient(path=db_path)
+    try:
+        existing = _qdrant_collection_names(client)
+        missing = [c for c in collections if c not in existing]
+        if missing:
+            client.close()
+            raise ValueError(
+                f"Missing Qdrant collections: {missing}. Available: {sorted(existing)}",
+            )
+
+        modes_per_collection = (
+            (MODE_DENSE_ONLY, MODE_HYBRID) if mode == MODE_BOTH else (mode,)
+        )
+
+        summaries: list[CollectionEvalSummary] = []
+        for coll in collections:
+            for run_mode in modes_per_collection:
+                logger.info(
+                    "=== Ablation cell: collection=%s, mode=%s ===", coll, run_mode,
+                )
+                summary = run_single_collection_evaluation(
+                    client=client,
+                    model=model,
+                    collection_name=coll,
+                    mode=run_mode,
+                    claims=claims,
+                    top_k=top_k,
+                    cross_encoder=cross_encoder,
+                    rerank_candidates=rerank_candidates,
+                )
+                summaries.append(summary)
+        return summaries
+    finally:
+        client.close()
+
+
+# ---------------------------------------------------------------------------
+# 8. Comparison report (JSON + Markdown)
+# ---------------------------------------------------------------------------
+
+
+def _summary_to_dict(summary: CollectionEvalSummary) -> dict:
+    """Serialise one cell summary including the per-claim breakdown."""
+    return {
+        "collection": summary.collection,
+        "mode": summary.mode,
+        "requested_mode": summary.requested_mode,
+        "fell_back_to_dense_only": summary.fell_back_to_dense_only,
+        "top_k": summary.top_k,
+        "summary_metrics": {
+            "total_claims": summary.total_claims,
+            "hits": summary.hits,
+            "misses": summary.total_claims - summary.hits,
+            "hit_at_k": summary.hit_at_k,
+            "mrr": summary.mrr,
+            "precision_at_k": summary.precision_at_k,
+        },
+        "detailed_results": summary.detailed_results,
+    }
+
+
+def write_comparison_json(
+    summaries: list[CollectionEvalSummary],
+    path: str | Path = DEFAULT_COMPARISON_JSON,
+    extra_metadata: dict | None = None,
+) -> Path:
+    """Persist the full ablation report as JSON.
+
+    Always includes per-claim ``detailed_results`` so post-hoc analyses
+    (significance tests, error analysis) can be run offline.
+    """
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict = {
+        "metadata": extra_metadata or {},
+        "cells": [_summary_to_dict(s) for s in summaries],
+    }
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    logger.info("Wrote comparison JSON report to %s", out.resolve())
+    return out
+
+
+def _collections_for_matrix(summaries: list[CollectionEvalSummary]) -> list[str]:
+    """Stable ordering: preserve first-occurrence order from *summaries*."""
+    seen: list[str] = []
+    for s in summaries:
+        if s.collection not in seen:
+            seen.append(s.collection)
+    return seen
+
+
+def _format_metric_cell(value: float, kind: str = "pct") -> str:
+    """Format a metric for the Markdown matrix table."""
+    if kind == "pct":
+        return f"{value * 100:.1f}%"
+    if kind == "mrr":
+        return f"{value:.3f}"
+    return f"{value:.4f}"
+
+
+def write_comparison_markdown(
+    summaries: list[CollectionEvalSummary],
+    path: str | Path = DEFAULT_COMPARISON_MD,
+    extra_metadata: dict | None = None,
+    auxiliary_stats: dict[str, dict] | None = None,
+) -> Path:
+    """Render the 4x2 ablation matrix as a Markdown report."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    cells: dict[tuple[str, str], CollectionEvalSummary] = {
+        (s.collection, s.mode): s for s in summaries
+    }
+    collections = _collections_for_matrix(summaries)
+    top_k = summaries[0].top_k if summaries else TOP_K
+
+    lines: list[str] = []
+    lines.append("# RAG Ablation Study - Comparison Report")
+    lines.append("")
+    if extra_metadata:
+        lines.append("## Run metadata")
+        lines.append("")
+        for key, value in extra_metadata.items():
+            lines.append(f"- **{key}**: {value}")
+        lines.append("")
+
+    lines.append(f"## 4 x 2 metric matrix (Hit@{top_k} / MRR / P@{top_k})")
+    lines.append("")
+    lines.append(
+        f"| Collection | dense_only Hit@{top_k} | dense_only MRR | dense_only P@{top_k} | "
+        f"hybrid Hit@{top_k} | hybrid MRR | hybrid P@{top_k} | hybrid fallback? |"
+    )
+    lines.append(
+        "|---|---|---|---|---|---|---|---|"
+    )
+    for coll in collections:
+        row = [f"`{coll}`"]
+        for mode in (MODE_DENSE_ONLY, MODE_HYBRID):
+            s = cells.get((coll, mode))
+            if s is None:
+                row += ["-", "-", "-"]
+                continue
+            row += [
+                _format_metric_cell(s.hit_at_k, "pct"),
+                _format_metric_cell(s.mrr, "mrr"),
+                _format_metric_cell(s.precision_at_k, "pct"),
+            ]
+        hybrid_s = cells.get((coll, MODE_HYBRID))
+        row.append("yes (no anchors)" if hybrid_s and hybrid_s.fell_back_to_dense_only else "no")
+        lines.append("| " + " | ".join(row) + " |")
+    lines.append("")
+
+    if auxiliary_stats:
+        lines.append("## Auxiliary chunk statistics per method")
+        lines.append("")
+        lines.append(
+            "| Collection | Chunks | Avg tokens | Median tokens | Chosen K (BIC) |"
+        )
+        lines.append("|---|---|---|---|---|")
+        for coll in collections:
+            stats = auxiliary_stats.get(coll, {})
+            lines.append(
+                f"| `{coll}` | "
+                f"{stats.get('num_chunks', '-')} | "
+                f"{stats.get('avg_tokens', '-')} | "
+                f"{stats.get('median_tokens', '-')} | "
+                f"{stats.get('chosen_k', '-')} |"
+            )
+        lines.append("")
+
+    lines.append("## Per-cell summary")
+    lines.append("")
+    for s in summaries:
+        lines.append(
+            f"### `{s.collection}` - mode=`{s.mode}` "
+            f"(requested=`{s.requested_mode}`)"
+        )
+        lines.append("")
+        lines.append(f"- Total claims: {s.total_claims}")
+        lines.append(f"- Hits: {s.hits}")
+        lines.append(f"- Hit@{s.top_k}: {_format_metric_cell(s.hit_at_k, 'pct')}")
+        lines.append(f"- MRR: {_format_metric_cell(s.mrr, 'mrr')}")
+        lines.append(f"- P@{s.top_k}: {_format_metric_cell(s.precision_at_k, 'pct')}")
+        if s.fell_back_to_dense_only:
+            lines.append("- Hybrid mode fell back to dense_only "
+                         "(no anchor_queries in payload).")
+        lines.append("")
+
+    out.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Wrote comparison Markdown report to %s", out.resolve())
+    return out
+
+
+# ---------------------------------------------------------------------------
 # CLI entry-point
 # ---------------------------------------------------------------------------
 
@@ -849,10 +1390,12 @@ def main() -> None:
     parser.add_argument(
         "--limit",
         type=int,
-        default=DOCUMENT_LIMIT,
+        default=None,
+        metavar="N",
         help=(
-            "Same N as semantic_chunker/baseline corpus limit — defines which "
-            f"evidence docs are 'in index' for eligibility (default: {DOCUMENT_LIMIT})"
+            "Same N as semantic_chunker/baseline corpus cap — defines which "
+            "evidence docs are treated as indexed for claim eligibility. "
+            "Omit for full evidence-filtered corpus (default; SciFact → 300 claims)."
         ),
     )
     parser.add_argument(
@@ -896,18 +1439,141 @@ def main() -> None:
             f"default: {DEFAULT_JSON_REPORT_PATH})"
         ),
     )
+    parser.add_argument(
+        "--rerank-model",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Optional sentence-transformers CrossEncoder model id "
+            "(e.g. cross-encoder/ms-marco-MiniLM-L-6-v2). When set, enriched "
+            "retrieval fetches --rerank-candidates rows, re-scores (claim, chunk) "
+            "pairs, then keeps top-K for metrics."
+        ),
+    )
+    parser.add_argument(
+        "--rerank-candidates",
+        type=int,
+        default=40,
+        metavar="N",
+        help=(
+            "Candidate pool size before cross-encoder re-ranking on the enriched "
+            "path (default: 40). Ignored unless --rerank-model is set."
+        ),
+    )
+    parser.add_argument(
+        "--collections",
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Run the 4x2 ablation evaluator over one or more Qdrant collections. "
+            "When provided, takes precedence over the legacy baseline-vs-enriched "
+            "pipeline. Use --mode to control dense_only / hybrid / both."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=SUPPORTED_MODES,
+        default=MODE_BOTH,
+        help=(
+            "Retrieval mode for the multi-collection ablation. dense_only uses "
+            "vector-only search; hybrid combines dense + lexical MatchText on "
+            "anchor_queries/keywords; 'both' runs each collection twice. "
+            "(default: both)"
+        ),
+    )
+    parser.add_argument(
+        "--comparison-json",
+        default=DEFAULT_COMPARISON_JSON,
+        help=(
+            "Output path for the multi-collection JSON report "
+            f"(default: {DEFAULT_COMPARISON_JSON})"
+        ),
+    )
+    parser.add_argument(
+        "--comparison-md",
+        default=DEFAULT_COMPARISON_MD,
+        help=(
+            "Output path for the multi-collection Markdown report "
+            f"(default: {DEFAULT_COMPARISON_MD})"
+        ),
+    )
 
     args = parser.parse_args()
 
+    if args.rerank_candidates < 1:
+        parser.error("--rerank-candidates must be >= 1")
+
+    if args.collections:
+        # New multi-collection path (Step 4 of the ablation study).
+        doc_limit = DOCUMENT_LIMIT if args.limit is None else args.limit
+        summaries = run_ablation_evaluation(
+            collections=list(args.collections),
+            mode=args.mode,
+            db_path=args.db_path,
+            document_limit=doc_limit,
+            sample_size=args.sample_size,
+            top_k=args.top_k,
+            random_seed=args.seed,
+            rerank_model=args.rerank_model,
+            rerank_candidates=args.rerank_candidates,
+        )
+        if not summaries:
+            print("Ablation evaluation produced no results.")
+            return
+
+        metadata = {
+            "db_path": args.db_path,
+            "mode": args.mode,
+            "top_k": args.top_k,
+            "sample_size": args.sample_size,
+            "rerank_model": args.rerank_model,
+            "rerank_candidates": args.rerank_candidates if args.rerank_model else None,
+        }
+        write_comparison_json(summaries, args.comparison_json, extra_metadata=metadata)
+        write_comparison_markdown(summaries, args.comparison_md, extra_metadata=metadata)
+
+        # Console summary for quick triage.
+        print()
+        print(_SEPARATOR)
+        print("  ABLATION SUMMARY (Hit@K / MRR / P@K)")
+        print(_SEPARATOR)
+        for s in summaries:
+            print(
+                f"  {s.collection:<28} mode={s.mode:<10} "
+                f"Hit@{s.top_k}={_format_metric_cell(s.hit_at_k, 'pct'):>6}  "
+                f"MRR={_format_metric_cell(s.mrr, 'mrr'):>6}  "
+                f"P@{s.top_k}={_format_metric_cell(s.precision_at_k, 'pct'):>6}"
+                + ("  (hybrid -> dense_only)" if s.fell_back_to_dense_only else "")
+            )
+        print(_SEPARATOR)
+        return
+
+    doc_limit = DOCUMENT_LIMIT if args.limit is None else args.limit
     results, compare_baseline_used = run_evaluation(
         db_path=args.db_path,
-        document_limit=args.limit,
+        document_limit=doc_limit,
         sample_size=args.sample_size,
         top_k=args.top_k,
         random_seed=args.seed,
         compare_baseline=not args.enriched_only,
+        rerank_model=args.rerank_model,
+        rerank_candidates=args.rerank_candidates,
     )
-    print_report(results, top_k=args.top_k, compare_baseline=compare_baseline_used)
+    enriched_label = (
+        "Enriched (hybrid w-RRF + CrossEncoder)"
+        if args.rerank_model
+        else "Enriched (hybrid w-RRF)"
+    )
+    print_report(
+        results,
+        top_k=args.top_k,
+        compare_baseline=compare_baseline_used,
+        enriched_method_label=enriched_label,
+        rerank_model=args.rerank_model,
+        rerank_candidates=args.rerank_candidates,
+    )
     EvaluationJsonExport(results, top_k=args.top_k).export_to_json(args.output)
 
 

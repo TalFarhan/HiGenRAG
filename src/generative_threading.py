@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 BASE_K = 3
 SIMILARITY_TOLERANCE = 0.05
-MIN_SIMILARITY_THRESHOLD = 0.60
+MIN_SIMILARITY_THRESHOLD = 0.45
 
 
 @dataclass

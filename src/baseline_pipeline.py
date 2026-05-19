@@ -1,7 +1,7 @@
 """
 Baseline Pipeline – Task 5 (Research Comparison Baseline)
 
-Builds a naive-chunking control group by loading 150 SciFact
+Builds a naive-chunking control group by loading SciFact
 documents (filtered by evidence in the golden set), splitting them with a fixed-size
 RecursiveCharacterTextSplitter (500 chars / 50 overlap), embedding them
 with all-mpnet-base-v2, and indexing the vectors in a dedicated
@@ -10,6 +10,7 @@ with all-mpnet-base-v2, and indexing the vectors in a dedicated
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 import uuid
@@ -28,7 +29,8 @@ from semantic_chunker import EMBEDDING_DIM, EMBEDDING_MODEL_NAME
 logger = logging.getLogger(__name__)
 
 DATASET_NAME = "scifact"
-DOCUMENT_LIMIT = 150
+# None = full evidence-filtered corpus (matches evaluation default).
+DOCUMENT_LIMIT: int | None = None
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 BASELINE_COLLECTION = "baseline_chunks"
@@ -51,16 +53,18 @@ def _get_evidence_doc_ids(dataset_name: str) -> set[str]:
     return evidence_ids
 
 
-def load_corpus(dataset_name: str = DATASET_NAME, limit: int = DOCUMENT_LIMIT) -> list[dict]:
+def load_corpus(dataset_name: str = DATASET_NAME, limit: int | None = DOCUMENT_LIMIT) -> list[dict]:
     """Load corpus filtered to documents that have evidence in the golden set.
 
     Steps:
       1. Load qrels from the test split and collect doc_ids with relevance > 0.
       2. Stream the corpus split and keep only documents whose ``_id`` appears
          in the evidence set.
-      3. Stop once *limit* documents have been collected.
+      3. If *limit* is an int, stop once that many documents have been collected;
+         if *limit* is ``None``, load every matching document.
     """
-    logger.info("Loading corpus: BeIR/%s (evidence-filtered, limit=%d)", dataset_name, limit)
+    lim_desc = "all" if limit is None else str(limit)
+    logger.info("Loading corpus: BeIR/%s (evidence-filtered, limit=%s)", dataset_name, lim_desc)
 
     evidence_doc_ids = _get_evidence_doc_ids(dataset_name)
     logger.info("Found %d unique doc_ids with evidence in qrels", len(evidence_doc_ids))
@@ -79,7 +83,7 @@ def load_corpus(dataset_name: str = DATASET_NAME, limit: int = DOCUMENT_LIMIT) -
                 "text": doc.text,
             }
         )
-        if len(documents) >= limit:
+        if limit is not None and len(documents) >= limit:
             break
 
     logger.info("Loaded %d documents from BeIR/%s (filtered by evidence)", len(documents), dataset_name)
@@ -215,9 +219,10 @@ def index_in_qdrant(
 # 5. End-to-end pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline() -> None:
+def run_pipeline(document_limit: int | None = None) -> None:
     """Execute the full baseline pipeline: load → chunk → embed → index."""
-    documents = load_corpus()
+    limit = DOCUMENT_LIMIT if document_limit is None else document_limit
+    documents = load_corpus(limit=limit)
     chunks = naive_chunk_documents(documents)
 
     model = SentenceTransformer(EMBEDDING_MODEL_NAME)
@@ -236,4 +241,21 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    run_pipeline()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Baseline naive chunking → embed → Qdrant "
+            f"(collection {BASELINE_COLLECTION!r})."
+        ),
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Evidence-filtered corpus cap (same meaning as semantic_chunker / "
+            "evaluation --limit). Omit for full evidence corpus (default)."
+        ),
+    )
+    args = parser.parse_args()
+    run_pipeline(document_limit=args.limit)

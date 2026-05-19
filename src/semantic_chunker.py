@@ -38,7 +38,9 @@ MIN_TOKENS = 256
 MAX_TOKENS = 512
 MAX_GLOBAL_TOPICS = 20
 MIN_GLOBAL_K = 3
-DOCUMENT_LIMIT = 150
+# None = load every document that appears in positive test qrels (SciFact: 283
+# docs → 300 evaluable claims). Set an int for a quick capped subset.
+DOCUMENT_LIMIT: int | None = None
 # PCA reduces sentence embeddings before GMM to mitigate high-dimensional mixing issues.
 GMM_PCA_N_COMPONENTS = 15
 
@@ -71,9 +73,13 @@ def _get_evidence_doc_ids(dataset_name: str) -> set[str]:
     return evidence_ids
 
 
-def load_corpus(dataset_name: str, limit: int = DOCUMENT_LIMIT) -> list[dict[str, Any]]:
-    """Load corpus filtered to documents with evidence in the golden qrels."""
-    logger.info("Loading corpus: %s (evidence-filtered, limit=%d)", dataset_name, limit)
+def load_corpus(dataset_name: str, limit: int | None = DOCUMENT_LIMIT) -> list[dict[str, Any]]:
+    """Load corpus filtered to documents with evidence in the golden qrels.
+
+    If *limit* is ``None``, every matching corpus document is loaded (no early stop).
+    """
+    lim_desc = "all" if limit is None else str(limit)
+    logger.info("Loading corpus: %s (evidence-filtered, limit=%s)", dataset_name, lim_desc)
 
     evidence_doc_ids = _get_evidence_doc_ids(dataset_name)
     logger.info("Found %d unique doc_ids with evidence in qrels", len(evidence_doc_ids))
@@ -92,7 +98,7 @@ def load_corpus(dataset_name: str, limit: int = DOCUMENT_LIMIT) -> list[dict[str
                 "text": doc.text,
             }
         )
-        if len(documents) >= limit:
+        if limit is not None and len(documents) >= limit:
             break
 
     logger.info("Loaded %d documents from %s (filtered by evidence)", len(documents), dataset_name)
@@ -574,7 +580,7 @@ def main() -> None:
         "--limit",
         type=int,
         default=None,
-        help="Process only the first N evidence documents (quick trials)",
+        help="Cap evidence documents for quick trials; omit for full evidence-filtered corpus",
     )
     parser.add_argument(
         "--min-global-k",
