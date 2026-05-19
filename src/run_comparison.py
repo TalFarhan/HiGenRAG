@@ -60,13 +60,16 @@ from sentence_window_chunker import (
     sentence_window_chunk_documents,
 )
 from llm_chunker import (
+    BOUNDARY_SIMILARITY_THRESHOLD,
     DEFAULT_CACHE_PATH as LLM_CACHE_PATH,
     LLM_MODEL_NAME,
     LOOKBACK_SENTENCES,
+    _EmbeddingBoundaryDetector,
     _LLMBoundaryJudge,
     _LLMResponseCache,
     llm_chunk_documents,
 )
+from generative_threading import ANCHOR_LLM_MODEL_NAME
 from semantic_chunker import (
     GMM_PCA_N_COMPONENTS,
     collect_core_sentences_per_topic,
@@ -118,7 +121,7 @@ METHODS: dict[str, dict[str, str]] = {
         "collection": "baseline_sentence_window",
     },
     "llm_boundary": {
-        "label": "LLM-boundary",
+        "label": "Embedding-Semantic boundary",
         "collection": "llm_chunks",
     },
     "semantic_gmm": {
@@ -232,20 +235,32 @@ def chunk_llm_boundary(
     lookback: int = LOOKBACK_SENTENCES,
     cache_path: Path = LLM_CACHE_PATH,
     model_name: str = LLM_MODEL_NAME,
+    threshold: float = BOUNDARY_SIMILARITY_THRESHOLD,
+    embedding_model: Optional[SentenceTransformer] = None,
 ) -> list[dict[str, Any]]:
-    """Method B: LLM-detected sentence boundaries with persistent cache."""
-    cache = _LLMResponseCache(cache_path)
-    judge = _LLMBoundaryJudge(cache=cache, model_name=model_name)
-    try:
-        chunks = llm_chunk_documents(
-            documents,
-            judge=judge,
-            min_tokens=min_tokens,
-            max_tokens=max_tokens,
-            lookback=lookback,
-        )
-    finally:
-        cache.save()
+    """Method B: embedding-based semantic boundary chunker.
+
+    The previous implementation called the Groq LLM after every sentence;
+    it has been replaced with a fully local detector that computes the
+    cosine similarity between each candidate sentence and a lookback
+    context vector built from the running chunk buffer. A boundary is
+    declared when the similarity falls below ``threshold``. The Groq API
+    is therefore no longer touched during chunking. ``cache_path`` is
+    accepted for CLI compatibility but is no longer used.
+    """
+    del cache_path  # legacy parameter, no LLM cache is required any more
+    detector = _EmbeddingBoundaryDetector(
+        model=embedding_model,
+        model_name=model_name,
+        threshold=threshold,
+    )
+    chunks = llm_chunk_documents(
+        documents,
+        judge=detector,
+        min_tokens=min_tokens,
+        max_tokens=max_tokens,
+        lookback=lookback,
+    )
     out = [_chunk_to_dict(c) for c in chunks]
     _save_chunks(out_path, out)
     return out
@@ -315,7 +330,9 @@ def run_chunking_stage(
         elif method == "sentence_window":
             chunks_by_method[method] = chunk_sentence_window(documents, path)
         elif method == "llm_boundary":
-            chunks_by_method[method] = chunk_llm_boundary(documents, path)
+            chunks_by_method[method] = chunk_llm_boundary(
+                documents, path, embedding_model=embedding_model,
+            )
         elif method == "semantic_gmm":
             chunks_by_method[method] = chunk_semantic_gmm(
                 documents, path, embedding_model=embedding_model,
@@ -734,7 +751,9 @@ def main() -> None:
         "sample_size": args.sample_size,
         "rerank_model": args.rerank_model,
         "rerank_candidates": args.rerank_candidates if args.rerank_model else None,
-        "anchor_llm_model": (None if args.no_llm_anchors else LLM_MODEL_NAME),
+        "boundary_chunker_model": LLM_MODEL_NAME,
+        "boundary_similarity_threshold": BOUNDARY_SIMILARITY_THRESHOLD,
+        "anchor_llm_model": (None if args.no_llm_anchors else ANCHOR_LLM_MODEL_NAME),
     }
     auxiliary = build_auxiliary_stats(methods, enriched_chunks_by_method, chosen_k_by_method)
 

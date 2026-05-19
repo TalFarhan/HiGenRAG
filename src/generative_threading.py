@@ -51,13 +51,20 @@ class ThreadedChunk:
     optimal_k: int = 1
 
 
+# Groq model used for anchor-query generation. This is now the ONLY
+# place in the pipeline where the Groq API is invoked – the chunking
+# stage was migrated to a fully local embedding-based detector to save
+# API tokens. See ``src/llm_chunker.py`` for the new chunker.
+ANCHOR_LLM_MODEL_NAME = "qwen/qwen3-32b"
+
+
 def _build_anchor_llm_chain():
     """Construct LangChain chain for a single global anchor query per topic."""
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_groq import ChatGroq
 
     llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
+        model=ANCHOR_LLM_MODEL_NAME,
         temperature=0.35,
         max_tokens=160,
     )

@@ -58,9 +58,22 @@
 
 ---
 
+## 3.3 חלוקה לפי גבולות סמנטיים מקומיים (Embedding-Based Boundary Chunker)
+
+`src/llm_chunker.py` היה בעבר מבוסס LLM שיפוטי (Groq) לזיהוי גבולות נושא; הוא הוחלף בגישה מקומית לחלוטין כדי לחסוך באסימוני API. המימוש החדש משתמש ב־`sentence-transformers/all-mpnet-base-v2` בלבד:
+
+- **קידוד מקומי:** כל משפט בכל מסמך מקודד פעם אחת בקבוצה (batch) דרך המודל המקומי.
+- **וקטור הקשר (Lookback Context Vector):** עבור משפט מועמד מחושב הממוצע הוקטורי המנורמל של עד `LOOKBACK_SENTENCES` המשפטים האחרונים בבופר.
+- **החלטת גבול:** מחושב **דמיון קוסינוס** בין המשפט המועמד לבין וקטור ההקשר. אם הדמיון נמוך מ־`BOUNDARY_SIMILARITY_THRESHOLD` (ברירת מחדל 0.55), הבופר נסגר לפני הוספת המשפט (כלומר המשפט פותח צ’אנק חדש).
+- **חסם קשיח:** אכיפת `MAX_TOKENS` נשמרה — חריגה ממנה גורמת לסגירת הבופר ללא תלות בהחלטה הסמנטית.
+- **בידוד שימוש ב־API:** Groq API (`qwen/qwen3-32b`) משמש כעת אך ורק בשלב ההעשרה ליצירת שאילתות העוגן (`generative_threading.py`); שלב החלוקה כולו רץ מקומית ואינו דורש `GROQ_API_KEY`.
+
+---
+
 ## English summary
 
 - **Embedding:** `[Doc: doc_id]` prefix; title inlined in text before sentence splitting; `all-mpnet-base-v2`.
 - **GMM:** single global mixture, `diag` covariances; **K** from **BIC** in `[MIN_GLOBAL_K, min(MAX_GLOBAL_TOPICS, n)]`.
 - **Chunks:** sequential merge; split on **majority-topic mismatch** or **max tokens**; `MIN_TOKENS` **not enforced**; core sentences vs **mean** cluster embedding (cosine).
-- **Pipeline:** chunk → **BERTopic enrichment** → global anchor (Groq) → **cosine** flexible top‑K → `synthetic_queries`.
+- **Pipeline:** chunk → **BERTopic enrichment** → global anchor (Groq `qwen/qwen3-32b`) → **cosine** flexible top‑K → `synthetic_queries`.
+- **Boundary chunker (Method B):** local sentence-transformer cosine similarity vs a lookback context vector with threshold `0.55`; no LLM API calls at chunk time. Groq API is reserved for the enrichment stage only.

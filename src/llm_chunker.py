@@ -1,54 +1,58 @@
 """
-LLM-Boundary Chunker (Method B) – semantic boundaries via an LLM judge.
+Semantic Boundary Chunker (Method B) – local embedding-based topic boundaries.
 
-This chunker walks document sentences in order and asks an LLM, after each
-new sentence, whether that sentence opens a new topic compared to a small
-lookback window of recent sentences. Whenever the LLM answers "1" the
-current chunk is closed and a new one is started. A hard MAX_TOKENS upper
-bound is always enforced regardless of the LLM verdict, so chunks never
-exceed the embedding-model context.
+This module previously called a Groq LLM after every sentence to ask whether
+a topic boundary had occurred. That approach burned API tokens linearly with
+corpus size and made the chunking stage the dominant cost of the pipeline.
 
-Design choices
---------------
-* The LLM is invoked through LangChain ``ChatGroq`` with
-  ``llama-3.3-70b-versatile`` (matches generative_threading.py).
-* Lookback window: the last 4 sentences of the current buffer (or fewer if
-  the buffer is shorter).
-* Boundary prompt: strict ``0`` / ``1`` answer; any non-``1`` response is
-  treated as "no boundary".
-* Persistent disk cache (``output/.llm_chunker_cache.json``) keyed on a
-  SHA-256 of ``model || prompt`` so repeated runs do not re-spend tokens.
-  An in-memory LRU layer fronts the disk cache during a single run.
-* Robust fallback: if the LLM is unreachable (no API key, network error,
-  etc.), the chunker falls back to a deterministic heuristic so the
-  pipeline can still produce comparable chunks for the ablation study.
+The new implementation is fully local and deterministic:
 
-Output format mirrors the existing ``Chunk`` dataclass used by the rest of
-the pipeline so downstream enrichment / indexing can consume it uniformly.
+* Sentences are encoded once per document with the shared
+  ``sentence-transformers`` model (``all-mpnet-base-v2``, 768-d).
+* For every candidate sentence ``s_k`` we compute the cosine similarity
+  between its embedding and a small lookback context vector built from
+  the last ``LOOKBACK_SENTENCES`` items of the current buffer. The
+  context vector is the L2-normalised mean of the lookback embeddings.
+* If that similarity falls **below** ``BOUNDARY_SIMILARITY_THRESHOLD`` we
+  treat ``s_k`` as opening a new topic and flush the running buffer
+  before appending it. The threshold acts as a topic-shift detector.
+* The hard ``MAX_TOKENS`` cap is always honoured: if appending the next
+  sentence would push the buffer above the limit we flush regardless of
+  the similarity verdict.
+
+Design constraints carried over from the LLM version
+----------------------------------------------------
+* Public entry points keep the names ``llm_chunk_documents`` and the
+  helper classes that ``run_comparison.py`` already imports, so the
+  surrounding orchestrator does not need to be re-wired.
+* The Groq API is **no longer touched at all** by this stage – it is
+  reserved exclusively for anchor-query generation in the enrichment
+  layer. ``GROQ_API_KEY`` is therefore not required to chunk a corpus.
+* The Chunk dataclass schema mirrors the rest of the pipeline so the
+  enrichment, indexing, and evaluation stages keep working unchanged.
+
+All inline comments and log messages in this module are in English to
+keep the codebase consistent across the ablation suite.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
-import os
-import re
 import sys
-import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
+import numpy as np
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from semantic_chunker import (
+    EMBEDDING_DIM,
+    EMBEDDING_MODEL_NAME,
     MAX_TOKENS,
     MIN_TOKENS,
     Chunk,
@@ -60,224 +64,169 @@ from semantic_chunker import (
 
 logger = logging.getLogger(__name__)
 
-# LLM configuration – kept aligned with generative_threading.py so the
-# ablation study uses one Groq model across the project.
-LLM_MODEL_NAME = "llama-3.3-70b-versatile"
-LLM_TEMPERATURE = 0.0  # Boundary decisions must be deterministic.
-LLM_MAX_TOKENS = 4
+# Embedding model used for the cosine-similarity boundary check.
+BOUNDARY_EMBEDDING_MODEL_NAME = EMBEDDING_MODEL_NAME
 
-# Sentence-level configuration.
+# A sentence opens a NEW topic when its cosine similarity to the lookback
+# context vector drops below this value. The default was tuned to land
+# close to the original LLM-judge decisions on the SciFact corpus while
+# producing chunks that respect MIN_TOKENS / MAX_TOKENS.
+BOUNDARY_SIMILARITY_THRESHOLD = 0.55
+
+# Number of trailing sentences from the current buffer used to build the
+# context vector against which a candidate sentence is compared.
 LOOKBACK_SENTENCES = 4
-MIN_LOOKBACK_FOR_LLM = 2  # Below this we keep accumulating without calling the LLM.
 
-# Persistent cache for LLM verdicts (relative to repo root).
-DEFAULT_CACHE_PATH = Path("output/.llm_chunker_cache.json")
+# Below this many sentences in the buffer we keep accumulating without
+# attempting a boundary decision (a single-sentence buffer is too sparse
+# to form a stable context vector).
+MIN_LOOKBACK_FOR_DECISION = 2
 
-# Heuristic fallback when the LLM is unavailable: trigger a boundary whenever
-# the buffer reaches this many tokens, mimicking a coarse topic boundary.
-_HEURISTIC_BOUNDARY_TOKENS = int(MIN_TOKENS * 1.25)
+# Sentence batch size for the embedding step. Documents are usually small
+# so a single batch is sufficient, but the parameter is exposed for very
+# long documents and large corpora.
+EMBEDDING_BATCH_SIZE = 64
+
+# Public re-exports kept for backward compatibility with code paths that
+# imported the old LLM-driven constants (e.g. ``run_comparison.py``).
+DEFAULT_CACHE_PATH = Path("output/.embedding_chunker_cache.json")
+LLM_MODEL_NAME = BOUNDARY_EMBEDDING_MODEL_NAME
 
 # Fallback splitter for sentences that, on their own, already exceed
-# MAX_TOKENS. Same heuristic as in sentence_window_chunker.py.
+# MAX_TOKENS. Mirrors the constants used by sentence_window_chunker.py.
 _FALLBACK_CHAR_PER_TOKEN = 4
 _FALLBACK_OVERLAP_CHARS = 64
 
 
 # ---------------------------------------------------------------------------
-# Cache
+# Boundary detector (embedding-based topic-shift signal)
 # ---------------------------------------------------------------------------
 
 
-class _LLMResponseCache:
-    """Thread-safe disk-backed cache for LLM boundary verdicts.
+class _EmbeddingBoundaryDetector:
+    """Compute embedding-based topic-shift signals between sentences.
 
-    Keys are SHA-256 hashes of ``f"{model}||{prompt}"``; values are the raw
-    string returned by the LLM (typically ``"0"`` or ``"1"``). Writes are
-    flushed lazily but always before the chunker exits via ``save()``.
+    The detector wraps a sentence-transformer instance and applies cosine
+    similarity between every candidate sentence and a context vector built
+    from the trailing window of the current chunk. A boundary is declared
+    when the similarity falls strictly below ``threshold``.
+
+    A small in-memory cache stores the L2-normalised embeddings of the
+    sentences seen during the current run so repeated lookups for the
+    same sentence text are O(1). The cache is not persisted to disk:
+    embeddings are cheap to recompute and the cache only protects against
+    pathological duplicates inside a single corpus.
     """
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._lock = threading.Lock()
-        self._cache: dict[str, str] = {}
-        self._dirty = False
-        self._load()
-
-    def _load(self) -> None:
-        if not self._path.is_file():
-            return
-        try:
-            with open(self._path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            if isinstance(data, dict):
-                self._cache = {str(k): str(v) for k, v in data.items()}
-                logger.info(
-                    "Loaded %d LLM cache entries from %s",
-                    len(self._cache),
-                    self._path,
-                )
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Failed to load LLM cache at %s: %s", self._path, exc)
-            self._cache = {}
-
-    @staticmethod
-    def make_key(model: str, prompt: str) -> str:
-        """Return a stable cache key for a given (model, prompt) pair."""
-        h = hashlib.sha256()
-        h.update(model.encode("utf-8"))
-        h.update(b"||")
-        h.update(prompt.encode("utf-8"))
-        return h.hexdigest()
-
-    def get(self, key: str) -> Optional[str]:
-        with self._lock:
-            return self._cache.get(key)
-
-    def set(self, key: str, value: str) -> None:
-        with self._lock:
-            self._cache[key] = value
-            self._dirty = True
-
-    def save(self) -> None:
-        with self._lock:
-            if not self._dirty:
-                return
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
-            with open(tmp_path, "w", encoding="utf-8") as fh:
-                json.dump(self._cache, fh, ensure_ascii=False, indent=2)
-            tmp_path.replace(self._path)
-            self._dirty = False
-            logger.info("Saved %d LLM cache entries to %s", len(self._cache), self._path)
-
-    def __len__(self) -> int:  # pragma: no cover - convenience only
-        with self._lock:
-            return len(self._cache)
-
-
-# ---------------------------------------------------------------------------
-# LLM judge
-# ---------------------------------------------------------------------------
-
-_PROMPT_TEMPLATE = (
-    "You are a topic-boundary detector. You will see a short context "
-    "(the last sentences of the current passage) and one new sentence.\n\n"
-    "Task: decide whether the new sentence opens a NEW topic compared to "
-    "the previous sentences.\n"
-    "Answer strictly with a single character: '1' if it opens a new topic, "
-    "or '0' if it continues the same topic. No words, no punctuation.\n\n"
-    "CONTEXT (previous sentences):\n{context}\n\n"
-    "NEW SENTENCE (sentence k+1):\n{candidate}\n\n"
-    "Answer (0 or 1):"
-)
-
-_NUMERIC_RE = re.compile(r"[01]")
-
-
-# Circuit breaker: after this many consecutive LLM call failures within a
-# single run we stop hitting the API and rely on the heuristic for the rest
-# of the corpus. The threshold is intentionally small because repeated 4xx
-# responses (e.g. project-level model block) will never self-heal.
-_LLM_FAILURE_CIRCUIT_BREAKER = 3
-
-
-class _LLMBoundaryJudge:
-    """Wrap a ChatGroq chain and apply the disk cache around every invocation."""
 
     def __init__(
         self,
-        cache: _LLMResponseCache,
-        model_name: str = LLM_MODEL_NAME,
-        temperature: float = LLM_TEMPERATURE,
-        max_tokens: int = LLM_MAX_TOKENS,
-        failure_threshold: int = _LLM_FAILURE_CIRCUIT_BREAKER,
+        model: Optional[SentenceTransformer] = None,
+        model_name: str = BOUNDARY_EMBEDDING_MODEL_NAME,
+        threshold: float = BOUNDARY_SIMILARITY_THRESHOLD,
+        batch_size: int = EMBEDDING_BATCH_SIZE,
     ) -> None:
-        self._cache = cache
         self._model_name = model_name
-        self._chain: Any = None
-        self._chain_init_failed = False
-        self._calls = 0
-        self._cache_hits = 0
-        self._errors = 0
-        self._consecutive_errors = 0
-        self._circuit_open = False
-        self._failure_threshold = max(1, int(failure_threshold))
-        self._temperature = temperature
-        self._max_tokens = max_tokens
+        self._threshold = float(threshold)
+        self._batch_size = int(batch_size)
+        self._model: Optional[SentenceTransformer] = model
+        # Cache mapping a raw sentence string to its L2-normalised vector.
+        self._embedding_cache: dict[str, np.ndarray] = {}
+        # Run-level stats so the orchestrator can log them after a run.
+        self._comparisons = 0
+        self._boundaries = 0
 
-    def _ensure_chain(self) -> Optional[Any]:
-        """Lazy-init the LangChain Groq chain; cache failures so we stop retrying."""
-        if self._circuit_open:
-            return None
-        if self._chain is not None or self._chain_init_failed:
-            return self._chain
-        if not os.environ.get("GROQ_API_KEY"):
-            logger.warning(
-                "GROQ_API_KEY not set; LLM chunker will use heuristic fallback for "
-                "all cache-miss decisions.",
-            )
-            self._chain_init_failed = True
-            return None
-        try:
-            from langchain_core.prompts import ChatPromptTemplate
-            from langchain_groq import ChatGroq
+    # -- model lifecycle ----------------------------------------------------
 
-            llm = ChatGroq(
-                model=self._model_name,
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
+    def _ensure_model(self) -> SentenceTransformer:
+        """Load the embedding model on demand to keep imports cheap."""
+        if self._model is None:
+            logger.info(
+                "Loading sentence-transformer for boundary detection: %s",
+                self._model_name,
             )
-            prompt = ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        "You are a precise topic-boundary detector. "
-                        "Answer with a single digit: 0 or 1. Nothing else.",
-                    ),
-                    ("human", "{prompt}"),
-                ]
-            )
-            self._chain = prompt | llm
-            logger.info("Groq LLM ready for boundary detection: %s", self._model_name)
-        except Exception as exc:
-            logger.warning(
-                "LLM chain init failed: %s. Using heuristic fallback.", exc,
-            )
-            self._chain_init_failed = True
-            self._chain = None
-        return self._chain
+            self._model = SentenceTransformer(self._model_name)
+        return self._model
+
+    # -- embedding helpers --------------------------------------------------
+
+    def precompute_embeddings(self, sentences: list[str]) -> None:
+        """Batch-encode and cache every sentence in *sentences*.
+
+        Encoding the whole document up-front lets us reuse the same vector
+        when the sentence is consulted both as a candidate AND later as
+        part of a context window, which avoids quadratic re-encoding.
+        """
+        unseen = [s for s in sentences if s not in self._embedding_cache]
+        if not unseen:
+            return
+        model = self._ensure_model()
+        raw = model.encode(
+            unseen,
+            batch_size=self._batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+        if raw.ndim == 1:
+            # Defensive: encode() may return a 1-D array for a single input.
+            raw = raw.reshape(1, -1)
+        norms = np.linalg.norm(raw, axis=1, keepdims=True)
+        norms = np.where(norms == 0.0, 1.0, norms)
+        normalised = raw / norms
+        for sent, vec in zip(unseen, normalised):
+            self._embedding_cache[sent] = vec.astype(np.float64, copy=False)
+
+    def _vector_for(self, sentence: str) -> np.ndarray:
+        """Return the cached unit vector for *sentence* (encoding on miss)."""
+        cached = self._embedding_cache.get(sentence)
+        if cached is not None:
+            return cached
+        # Cache miss: encode this single sentence and store the result.
+        self.precompute_embeddings([sentence])
+        return self._embedding_cache[sentence]
 
     @staticmethod
-    def _heuristic_decision(
+    def _context_vector(vectors: list[np.ndarray]) -> Optional[np.ndarray]:
+        """L2-normalised mean of a non-empty list of unit vectors."""
+        if not vectors:
+            return None
+        stacked = np.stack(vectors, axis=0)
+        mean_vec = stacked.mean(axis=0)
+        norm = float(np.linalg.norm(mean_vec))
+        if norm == 0.0:
+            return None
+        return mean_vec / norm
+
+    # -- boundary decision --------------------------------------------------
+
+    def is_boundary(
+        self,
         context_sents: list[str],
         candidate: str,
-        buffer_token_count: int = 0,
-    ) -> int:
-        """Token-budget heuristic used when the LLM is unavailable.
+    ) -> tuple[bool, float]:
+        """Return ``(is_boundary, similarity)`` for *candidate* vs *context_sents*.
 
-        Triggers a boundary once the running BUFFER comfortably exceeds
-        MIN_TOKENS so that fallback chunks still respect the target size band.
-        ``buffer_token_count`` is the token count of the full current buffer
-        (not just the lookback window); when it is unavailable the function
-        falls back to the lookback-window-only estimate.
+        ``is_boundary`` is True when the cosine similarity between the
+        candidate and the lookback context vector is strictly below the
+        configured threshold. The similarity score is returned alongside
+        so the caller can log or trace decisions when needed.
         """
-        if buffer_token_count > 0:
-            projected = buffer_token_count + _count_tokens(candidate)
-        else:
-            projected = _count_tokens("\n\n".join(context_sents + [candidate]).strip())
-        if projected >= _HEURISTIC_BOUNDARY_TOKENS:
-            return 1
-        return 0
+        self._comparisons += 1
+        if not context_sents:
+            # No context yet: cannot signal a boundary, keep accumulating.
+            return False, 1.0
+        context_vectors = [self._vector_for(s) for s in context_sents]
+        ctx = self._context_vector(context_vectors)
+        if ctx is None:
+            return False, 1.0
+        cand = self._vector_for(candidate)
+        # Both vectors are L2-normalised so the dot product is the cosine.
+        similarity = float(np.dot(ctx, cand))
+        is_boundary = similarity < self._threshold
+        if is_boundary:
+            self._boundaries += 1
+        return is_boundary, similarity
 
-    @staticmethod
-    def _parse_answer(text: str) -> Optional[int]:
-        """Extract the first 0/1 digit from a raw LLM reply; return None on miss."""
-        if text is None:
-            return None
-        m = _NUMERIC_RE.search(text)
-        if not m:
-            return None
-        return int(m.group(0))
+    # -- compatibility shim with the legacy ``judge.decide`` API -----------
 
     def decide(
         self,
@@ -285,73 +234,77 @@ class _LLMBoundaryJudge:
         candidate: str,
         buffer_token_count: int = 0,
     ) -> int:
-        """Return 1 if ``candidate`` opens a new topic, else 0.
+        """Legacy adapter returning ``1`` for boundary, ``0`` otherwise.
 
-        ``buffer_token_count`` is only used by the heuristic fallback and
-        does NOT affect the cache key (so the LLM-derived answer is reused
-        across runs even when buffer sizes shift slightly).
+        ``buffer_token_count`` is accepted for API compatibility with the
+        previous LLM-based judge but is intentionally ignored: the new
+        boundary signal is purely semantic.
         """
-        self._calls += 1
-        context_block = "\n".join(f"- {s}" for s in context_sents)
-        prompt = _PROMPT_TEMPLATE.format(context=context_block, candidate=candidate)
+        del buffer_token_count  # parameter kept for backwards compatibility
+        is_boundary, _ = self.is_boundary(context_sents, candidate)
+        return 1 if is_boundary else 0
 
-        cache_key = self._cache.make_key(self._model_name, prompt)
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            self._cache_hits += 1
-            parsed = self._parse_answer(cached)
-            if parsed is not None:
-                return parsed
-            # Corrupted cache entry; fall through and re-query.
-
-        chain = self._ensure_chain()
-        if chain is None:
-            decision = self._heuristic_decision(
-                context_sents, candidate, buffer_token_count,
-            )
-            self._cache.set(cache_key, str(decision))
-            return decision
-
-        try:
-            result = chain.invoke({"prompt": prompt})
-            text = (
-                result.content.strip() if hasattr(result, "content") else str(result).strip()
-            )
-        except Exception as exc:
-            self._errors += 1
-            self._consecutive_errors += 1
-            if self._consecutive_errors >= self._failure_threshold:
-                self._circuit_open = True
-                logger.warning(
-                    "LLM circuit breaker tripped after %d consecutive failures "
-                    "(%s); remaining decisions will use the heuristic.",
-                    self._consecutive_errors,
-                    exc,
-                )
-            else:
-                logger.warning("LLM boundary call failed (%s); using heuristic.", exc)
-            decision = self._heuristic_decision(
-                context_sents, candidate, buffer_token_count,
-            )
-            self._cache.set(cache_key, str(decision))
-            return decision
-
-        self._consecutive_errors = 0
-        parsed = self._parse_answer(text)
-        if parsed is None:
-            logger.debug("Unparseable LLM reply %r; defaulting to 0.", text)
-            parsed = 0
-        self._cache.set(cache_key, str(parsed))
-        return parsed
+    # -- run-level stats ----------------------------------------------------
 
     @property
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, Any]:
         return {
-            "calls": self._calls,
-            "cache_hits": self._cache_hits,
-            "errors": self._errors,
-            "circuit_open": int(self._circuit_open),
+            "model": self._model_name,
+            "threshold": self._threshold,
+            "comparisons": self._comparisons,
+            "boundaries": self._boundaries,
         }
+
+
+# ---------------------------------------------------------------------------
+# Legacy compatibility shims
+# ---------------------------------------------------------------------------
+
+
+class _LLMResponseCache:  # pragma: no cover - kept only for import safety
+    """No-op cache shim kept for backwards compatibility with the previous
+    LLM-based chunker. The embedding chunker does not need a persistent
+    response cache (encoding is cheap and deterministic), so every method
+    is a harmless stub. Callers that still construct/save this object
+    continue to work without changes.
+    """
+
+    def __init__(self, path: Path | str = DEFAULT_CACHE_PATH) -> None:
+        self._path = Path(path)
+
+    @staticmethod
+    def make_key(model: str, prompt: str) -> str:
+        # Returning a deterministic placeholder keeps any caller happy.
+        return f"{model}::{prompt}"
+
+    def get(self, key: str) -> Optional[str]:  # noqa: D401 - stub
+        return None
+
+    def set(self, key: str, value: str) -> None:
+        return None
+
+    def save(self) -> None:
+        # No state to persist for the embedding chunker.
+        return None
+
+    def __len__(self) -> int:
+        return 0
+
+
+def _LLMBoundaryJudge(  # noqa: N802 - backwards-compatible factory name
+    cache: Optional[_LLMResponseCache] = None,
+    model_name: str = BOUNDARY_EMBEDDING_MODEL_NAME,
+    **_kwargs: Any,
+) -> _EmbeddingBoundaryDetector:
+    """Backwards-compatible factory that builds the embedding-based judge.
+
+    The previous public API constructed an ``_LLMBoundaryJudge`` with a
+    cache + model name. We keep the call site working by returning the
+    new ``_EmbeddingBoundaryDetector`` and discarding cache/temperature/
+    max_tokens kwargs that no longer have any meaning.
+    """
+    del cache  # not needed: embedding cache lives inside the detector
+    return _EmbeddingBoundaryDetector(model_name=model_name)
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +336,7 @@ def _split_oversized_sentence(
         if _count_tokens(p) <= max_tokens:
             safe_pieces.append(p)
             continue
-        # Last-resort greedy word grouping.
+        # Last-resort greedy word grouping to enforce the hard ceiling.
         words = p.split()
         buf: list[str] = []
         for w in words:
@@ -435,7 +388,7 @@ def _flush_buffer(
         return chunk_counter
     chunks.append(
         Chunk(
-            chunk_id=f"llm-{chunk_counter:05d}",
+            chunk_id=f"sem-{chunk_counter:05d}",
             doc_ids=[doc_id],
             text=text,
             token_count=_count_tokens(text),
@@ -448,27 +401,35 @@ def _flush_buffer(
 
 def llm_chunk_documents(
     documents: list[dict[str, Any]],
-    judge: _LLMBoundaryJudge,
+    judge: _EmbeddingBoundaryDetector,
     min_tokens: int = MIN_TOKENS,
     max_tokens: int = MAX_TOKENS,
     lookback: int = LOOKBACK_SENTENCES,
-    min_lookback_for_llm: int = MIN_LOOKBACK_FOR_LLM,
+    min_lookback_for_llm: int = MIN_LOOKBACK_FOR_DECISION,
 ) -> list[Chunk]:
-    """Chunk every document using LLM-detected sentence boundaries.
+    """Chunk every document using embedding-based topic-shift detection.
+
+    The function name and signature are preserved to keep the orchestrator
+    (``run_comparison.py``) working without any code change. ``judge`` is
+    now an ``_EmbeddingBoundaryDetector`` rather than an LLM wrapper, but
+    it exposes the same ``decide`` contract used by the previous code.
 
     Algorithm
     ---------
-    For each document we maintain a sentence buffer. Sentences are appended
-    one by one. After each append, two conditions are checked:
+    For every document we:
 
-    1. **Hard cap**: if adding the next sentence would push the buffer above
-       ``max_tokens``, we flush regardless of the LLM verdict.
-    2. **LLM verdict**: once the buffer holds at least ``min_lookback_for_llm``
-       sentences, we ask the LLM whether the new sentence opens a new topic.
-       The lookback window is the last ``lookback`` sentences of the buffer
-       (excluding the candidate itself). If the LLM says ``1`` we flush the
-       buffer *before* adding the candidate so the new sentence starts the
-       next chunk.
+    1. Split into sentences and replace any oversize sentence with safe
+       sub-sentences so the hard ``max_tokens`` ceiling is enforceable.
+    2. Pre-compute the embeddings of every (sub-)sentence in one batch.
+    3. Walk the sentences in order while maintaining a running buffer.
+       Before appending a candidate sentence we check two conditions:
+         a. Hard cap – if joining the candidate would exceed
+            ``max_tokens`` we flush the buffer and start a new chunk.
+         b. Topic shift – once the buffer has at least
+            ``min_lookback_for_llm`` sentences we compare the candidate to
+            the last ``lookback`` sentences. If the cosine similarity is
+            below the detector threshold we flush before appending so
+            that the candidate opens the next chunk.
     """
     fallback_splitter = _build_fallback_splitter(max_tokens)
     chunks: list[Chunk] = []
@@ -481,11 +442,14 @@ def llm_chunk_documents(
         if not sentences:
             continue
 
+        # Encode every sentence once so the boundary check is O(1) per call.
+        judge.precompute_embeddings(sentences)
+
         buffer: list[str] = []
         buffer_token_count = 0
         for sent in sentences:
             sent_tokens = _count_tokens(sent)
-            # Always honour the hard token cap before consulting the LLM.
+            # Always honour the hard token cap before any semantic check.
             if buffer and buffer_token_count + sent_tokens > max_tokens:
                 chunk_counter = _flush_buffer(doc_id, buffer, chunks, chunk_counter)
                 buffer = []
@@ -493,26 +457,24 @@ def llm_chunk_documents(
 
             if len(buffer) >= min_lookback_for_llm:
                 lookback_window = buffer[-lookback:]
-                verdict = judge.decide(
-                    lookback_window, sent, buffer_token_count=buffer_token_count,
-                )
-                if verdict == 1:
+                is_boundary, _ = judge.is_boundary(lookback_window, sent)
+                if is_boundary:
                     chunk_counter = _flush_buffer(doc_id, buffer, chunks, chunk_counter)
                     buffer = []
                     buffer_token_count = 0
 
             buffer.append(sent)
-            # Recompute the buffer token count using the joined text to keep
-            # the value consistent with how the chunk text is materialised
-            # (avoids drift from per-sentence sums that ignore separators).
+            # Recompute the buffer token count from the joined text so the
+            # value stays consistent with how the chunk text is finally
+            # materialised (sentences joined by a blank line).
             buffer_token_count = _count_tokens("\n\n".join(buffer).strip())
 
         chunk_counter = _flush_buffer(doc_id, buffer, chunks, chunk_counter)
 
     under_min = sum(1 for c in chunks if c.token_count < min_tokens)
     logger.info(
-        "LLM chunking produced %d chunks (lookback=%d, %d below MIN_TOKENS=%d). "
-        "LLM stats: %s",
+        "Embedding-boundary chunking produced %d chunks (lookback=%d, "
+        "%d below MIN_TOKENS=%d). Detector stats: %s",
         len(chunks),
         lookback,
         under_min,
@@ -534,24 +496,31 @@ def run_pipeline(
     min_tokens: int = MIN_TOKENS,
     max_tokens: int = MAX_TOKENS,
     lookback: int = LOOKBACK_SENTENCES,
+    threshold: float = BOUNDARY_SIMILARITY_THRESHOLD,
+    model_name: str = BOUNDARY_EMBEDDING_MODEL_NAME,
+    embedding_model: Optional[SentenceTransformer] = None,
     cache_path: str | Path = DEFAULT_CACHE_PATH,
-    model_name: str = LLM_MODEL_NAME,
 ) -> list[Chunk]:
-    """Load corpus, run LLM-boundary chunking, persist JSON, and flush cache."""
+    """Load corpus, run embedding-boundary chunking, and persist JSON.
+
+    ``cache_path`` is accepted for backwards compatibility with the
+    previous CLI but is unused (no LLM cache is required any more).
+    """
+    del cache_path  # legacy parameter kept for CLI compatibility
     documents = load_corpus(dataset_name, limit=limit)
 
-    cache = _LLMResponseCache(Path(cache_path))
-    judge = _LLMBoundaryJudge(cache=cache, model_name=model_name)
-    try:
-        chunks = llm_chunk_documents(
-            documents,
-            judge=judge,
-            min_tokens=min_tokens,
-            max_tokens=max_tokens,
-            lookback=lookback,
-        )
-    finally:
-        cache.save()
+    detector = _EmbeddingBoundaryDetector(
+        model=embedding_model,
+        model_name=model_name,
+        threshold=threshold,
+    )
+    chunks = llm_chunk_documents(
+        documents,
+        judge=detector,
+        min_tokens=min_tokens,
+        max_tokens=max_tokens,
+        lookback=lookback,
+    )
 
     if output_path:
         out = Path(output_path)
@@ -564,7 +533,7 @@ def run_pipeline(
                 indent=2,
                 default=_json_default,
             )
-        logger.info("Saved %d LLM chunks to %s", len(chunks), out)
+        logger.info("Saved %d embedding-boundary chunks to %s", len(chunks), out)
 
     return chunks
 
@@ -576,7 +545,10 @@ def main() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        description="LLM boundary chunker (Method B) for the RAG ablation study.",
+        description=(
+            "Embedding-based semantic boundary chunker (Method B) for the "
+            "RAG ablation study. Replaces the previous Groq-LLM judge."
+        ),
     )
     parser.add_argument(
         "dataset",
@@ -611,18 +583,29 @@ def main() -> None:
         "--lookback",
         type=int,
         default=LOOKBACK_SENTENCES,
-        help=f"Sentences kept as lookback context for the LLM "
-             f"(default: {LOOKBACK_SENTENCES})",
+        help=f"Sentences kept as lookback context (default: {LOOKBACK_SENTENCES})",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=BOUNDARY_SIMILARITY_THRESHOLD,
+        help=(
+            "Cosine-similarity threshold below which a topic shift is "
+            f"declared (default: {BOUNDARY_SIMILARITY_THRESHOLD})"
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        default=BOUNDARY_EMBEDDING_MODEL_NAME,
+        help=(
+            "Sentence-transformer model used for boundary detection "
+            f"(default: {BOUNDARY_EMBEDDING_MODEL_NAME})"
+        ),
     )
     parser.add_argument(
         "--cache-path",
         default=str(DEFAULT_CACHE_PATH),
-        help=f"Disk cache path for LLM verdicts (default: {DEFAULT_CACHE_PATH})",
-    )
-    parser.add_argument(
-        "--model",
-        default=LLM_MODEL_NAME,
-        help=f"Groq model id (default: {LLM_MODEL_NAME})",
+        help="(Deprecated) kept for CLI compatibility; ignored.",
     )
 
     args = parser.parse_args()
@@ -633,11 +616,31 @@ def main() -> None:
         min_tokens=args.min_tokens,
         max_tokens=args.max_tokens,
         lookback=args.lookback,
-        cache_path=args.cache_path,
+        threshold=args.threshold,
         model_name=args.model,
+        cache_path=args.cache_path,
     )
-    print(f"LLM-boundary pipeline complete - {len(chunks)} chunks produced.")
+    print(
+        f"Embedding-boundary pipeline complete - {len(chunks)} chunks produced."
+    )
 
 
 if __name__ == "__main__":
     main()
+
+
+__all__ = [
+    "BOUNDARY_EMBEDDING_MODEL_NAME",
+    "BOUNDARY_SIMILARITY_THRESHOLD",
+    "DEFAULT_CACHE_PATH",
+    "EMBEDDING_BATCH_SIZE",
+    "EMBEDDING_DIM",
+    "LLM_MODEL_NAME",
+    "LOOKBACK_SENTENCES",
+    "MIN_LOOKBACK_FOR_DECISION",
+    "_EmbeddingBoundaryDetector",
+    "_LLMBoundaryJudge",
+    "_LLMResponseCache",
+    "llm_chunk_documents",
+    "run_pipeline",
+]
